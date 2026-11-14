@@ -1,11 +1,13 @@
 import base64
 import copy
 import hashlib
+import html
 import io
 import json
 import math
 import os
 import re
+import shutil
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -187,6 +189,7 @@ class Config:
     n_stocks: int = 0                   # selected stocks - equal weight divides capital by this when no max-position limit
     no_limit: bool = False
     cloud_filter: str = ""              # optional Ichimoku cloud filter: "" (off) | "Above" | "Center" | "Below"
+    cloud_exit: str = ""                # optional Ichimoku cloud EXIT: "" (off) | "Above" | "Center" | "Below" (comma separated for several)
     entry_times: str = ""               # OPTIONAL time condition: comma separated candle times "HH:MM,HH:MM" ("" = all times)
     exit_at: str = ""                   # TIME CONDITION: square-off time (HH:MM) ("" = default 15:15 NSE / 23:15 MCX)
 
@@ -228,6 +231,7 @@ def _cfg_from_data(d):
         n_stocks=len(d.get("items") or []),
         no_limit=bool(d.get("no_limit", False)),
         cloud_filter=cloud_text(d.get("cloud_filter")),
+        cloud_exit=cloud_text(d.get("cloud_exit")),
         entry_times=str(d.get("entry_times") or ""),
         exit_at=str(d.get("exit_at") or ""),
         max_hold=int(d.get("max_hold", MAX_HOLD_DAYS) or MAX_HOLD_DAYS),
@@ -371,6 +375,20 @@ def cloud_position(df):
         return None
     close = float(df["close"].iat[-1])
     return "Above" if close > last["top"] else "Below" if close < last["bottom"] else "Center"
+
+
+def cloud_exit_events(df, cfg, exchange):
+    """{candle END time: 'Above'/'Center'/'Below'} for every candle whose CLOSE sits in one of the chosen exit cloud positions.
+       Empty dict when the cloud exit is off."""
+    sel = cloud_list(cfg.cloud_exit)
+    if not sel or df is None or df.empty:
+        return {}
+    cl = ichimoku_cloud(df)
+    close = df["close"].astype(float)
+    pos = np.where(cl["top"].isna(), "n/a", np.where(close > cl["top"], "Above",
+                   np.where(close < cl["bottom"], "Below", "Center")))
+    tf = pd.Timedelta(minutes=cfg.tf_min)
+    return {candle_end(t, tf, exchange): p for t, p in zip(df["date"], pos) if p in sel}
 
 
 # ============================== ANGEL ONE ==============================
@@ -715,6 +733,19 @@ def index_members(exchange, index):
     return out
 
 
+def build_index_map(items, exchange, index_pick):
+    """{symbol: ['Nifty 50', 'Nifty Bank', ...]} - which of the chosen indices each selected stock belongs to
+       (a stock in two indices is listed under both)."""
+    out = {}
+    for ix in (index_pick or []):
+        mem = index_members(exchange, (ix,))
+        for it in items:
+            keys = {str(it.get("name", "")).upper(), str(it["symbol"]).upper(), str(it.get("tradingsymbol", "")).upper()}
+            if keys & mem:
+                out.setdefault(it["symbol"], []).append(ix)
+    return out
+
+
 def exchange_list(df, exchange, index=None):
     index = tuple(index) if index else None
     d = df[df["exch_seg"] == exchange].copy()
@@ -766,7 +797,7 @@ def to_item(row, exchange):
         tick = 0.05
     return {
         "symbol": row["label"], "tradingsymbol": row["symbol"], "token": row["token"],
-        "exchange": exchange, "lot": lot, "tick": tick,
+        "exchange": exchange, "lot": lot, "tick": tick, "name": str(row.get("name") or row["label"]),
     }
 
 
@@ -898,7 +929,7 @@ def _sizing_inputs(c_mode, c_val, capital, max_open, no_limit, n_items, key,
                             index=keys.index(cur_mode) if cur_mode in keys else 0, key=f"{key}_size_mode",
                             help="Amount = oru position-ku evvalavu Rs | Qty = oru position-ku evvalavu qty "
                                  "(shares; NFO/MCX-la lots) | Equal weight = capital / max positions "
-                                 "(no limit na capital / select panna stocks)")
+                                 "(no limit capital / selected stocks)")
     mode = keys[[SIZE_LABELS[k] for k in keys].index(pick)]
     eq = _equal_amt(capital, max_open, no_limit, n_items)
     if mode == "qty":
@@ -974,8 +1005,10 @@ def _bt_deadline(etime, ex, max_hold, xt=None):
     return pd.Timestamp(day) + pd.Timedelta(hours=xt.hour, minutes=xt.minute)
 
 
-def _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl):
+def _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl, cx=None):
     """Walk forward from bar i0. SL is checked before target inside a bar (same as _check_exit).
+       cx (optional) = per-bar cloud-exit position ('' = no signal): when a bar CLOSES in a chosen cloud position and neither
+       SL nor target was hit inside it, the trade exits at that bar's close.
        Returns (price, time, reason) or None when there is no bar to walk."""
     n, k, last = len(T), i0, None
     while k < n and T[k] < deadline:
@@ -988,6 +1021,8 @@ def _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl):
             return float(O[k]), T[k], "Target (gap)"
         if H[k] >= tgt:
             return float(tgt), T[k], "Target"
+        if cx is not None and cx[k]:
+            return float(C[k]), T[k], f"Cloud exit ({cx[k]})"
         last = k
         k += 1
     if last is None:
@@ -1096,7 +1131,7 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
     warm = pd.Timedelta(days=CLOUD_DAYS.get(cfg.interval, 10) + 5)      # always load enough history for the reference cloud column
     tail = pd.Timedelta(days=int(cfg.max_hold) * 2 + 5)                                    # room for exits after To date
     load_to = min(end + tail, now_ist() + pd.Timedelta(days=1))
-    errors, cands, sigs, bars = [], [], [], {}
+    errors, cands, sigs, bars, cxs = [], [], [], {}, {}
 
     def load(it):
         df = _bt_load(smart, it, cfg.interval, start - warm, load_to)
@@ -1126,6 +1161,10 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
             bars[(it["exchange"], it["symbol"])] = (
                 src["date"].tolist(), src["open"].astype(float).to_numpy(), src["high"].astype(float).to_numpy(),
                 src["low"].astype(float).to_numpy(), src["close"].astype(float).to_numpy(), src is df)
+            if cloud_list(cfg.cloud_exit):                  # cloud EXIT: mark every walk bar that closes a matching cloud candle
+                cmap = cloud_exit_events(df, cfg, it["exchange"])
+                bl = pd.Timedelta(minutes=cfg.tf_min) if src is df else pd.Timedelta(minutes=1)
+                cxs[(it["exchange"], it["symbol"])] = [cmap.get(candle_end(t, bl, it["exchange"]), "") for t in src["date"]]
             if precise and (b1 is None or b1.empty):
                 errors.append(f"{it['symbol']}: no 1-minute data, used {cfg.interval} candles for exits")
 
@@ -1133,7 +1172,7 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
         T, O, H, L, C, same_tf = bars[(c["exchange"], c["symbol"])]
         i0 = c["j"] if same_tf else bisect.bisect_left(T, c["etime"])
         deadline = _bt_deadline(c["etime"], c["exchange"], cfg.max_hold, eff_exit(cfg, c["exchange"]))
-        hit = _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl)
+        hit = _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl, cxs.get((c["exchange"], c["symbol"])))
         if hit is None:
             return None
         px, xt, reason = hit
@@ -1262,12 +1301,61 @@ def _bt_quick(trades, capital, tf_min):
                                                     if enough else f"Every {title.lower()} has fewer than {MIN_TRADES_BEST} trades - treat with caution."))
 
 
+def _bt_by_index(trades, imap, capital, tf_min):
+    """Result split per index. A stock that belongs to two chosen indices counts in both."""
+    t = trades.copy()
+    t["index"] = t["symbol"].map(imap)
+    t = t.dropna(subset=["index"]).explode("index")
+    if t.empty:
+        st.info("No trades belong to the chosen indices.")
+        return
+    st.caption("Every index, best first. Numbers are slices of the SAME combined run (shared capital / max positions), "
+               "so they are not a separate backtest of each index, and a stock in two indices is counted in both.")
+    st.dataframe(_bt_table(_bt_rank(t, ["index"], capital, tf_min)[0]), use_container_width=True, hide_index=True)
+    pick = st.selectbox("See one index in detail", sorted(t["index"].unique()), key="bt_index_view")
+    one = t[t["index"] == pick].drop(columns=["index"]).reset_index(drop=True)
+    s = bt_stats(one, capital)
+    c = st.columns(4)
+    c[0].metric("Net P&L", f"{s['net']:,.0f}", f"{s['ret']:.2f}% of capital")
+    c[1].metric("Trades", s["n"], f"{s['wins']}W / {s['losses']}L", delta_color="off")
+    c[2].metric("Win rate", f"{s['win_rate']:.1f}%")
+    c[3].metric("Profit factor", "inf" if math.isinf(s["pf"]) else f"{s['pf']:.2f}")
+    st.line_chart(one.set_index("exit_time")["pnl"].cumsum().rename("Cumulative P&L"))
+    st.markdown("**By stock**")
+    st.dataframe(_bt_table(_bt_rank(one, ["symbol"], capital, tf_min)[0]), use_container_width=True, hide_index=True)
+    st.markdown("**By pattern**")
+    st.dataframe(_bt_table(_bt_rank(one, ["pattern"], capital, tf_min)[0]), use_container_width=True, hide_index=True)
+    st.markdown("**Trades**")
+    st.dataframe(one, use_container_width=True, hide_index=True)
+    _csv_button(f"⬇ {pick} trades CSV", one, f"backtest_trades_{pick.replace(' ', '_')}", "bt_dl_index_trades")
+
+
+ALL_INDICES = "All indices (combined)"
+
+
 def _bt_show(res, capital):
     trades, signals = res["trades"], res["signals"]
     for e in res["errors"][:15]:
         st.warning(e)
     if len(res["errors"]) > 15:
         st.caption(f"... and {len(res['errors']) - 15} more data warnings")
+    imap = res.get("index_map") or {}
+    if imap:                                                 # 2+ indices were chosen -> list them; default = full combined result
+        ix_list = sorted({ix for v in imap.values() for ix in v})
+        opts = [ALL_INDICES] + ix_list
+        if st.session_state.get("bt_index_filter") not in opts:
+            st.session_state.pop("bt_index_filter", None)
+        pick_ix = st.selectbox("Show result for", opts, key="bt_index_filter",
+                               help="Default = everything combined. Pick one index to see only its stocks' trades, "
+                                    "stats, charts and tables.")
+        if pick_ix != ALL_INDICES:
+            syms = {sy for sy, v in imap.items() if pick_ix in v}
+            trades = trades[trades["symbol"].isin(syms)].reset_index(drop=True)
+            if signals is not None and not signals.empty:
+                signals = signals[signals["symbol"].isin(syms)].reset_index(drop=True)
+            res = {**res, "index_map": {}}                   # one index only -> no 'By index' comparison tab
+            st.caption(f"Showing only **{pick_ix}** stocks ({len(syms)}). Numbers are a slice of the same combined run "
+                       f"(shared capital / max positions); a stock in two indices shows under both.")
     if trades.empty:
         st.info("No trades in this period (no signal passed the filters). Try a longer period / more patterns / more stocks.")
         if signals is not None and not signals.empty:
@@ -1291,7 +1379,13 @@ def _bt_show(res, capital):
     eq = trades.set_index("exit_time")["pnl"].cumsum().rename("Cumulative P&L")
     st.line_chart(eq)
 
-    t_tr, t_sg, t_st, t_pt, t_bc, t_dy = st.tabs(["Trades", "Signals", "By stock", "By pattern", "Best combos", "By day"])
+    imap = res.get("index_map") or {}
+    names = ["Trades", "Signals", "By stock", "By pattern", "Best combos", "By day"] + (["By index"] if imap else [])
+    tabs = st.tabs(names)
+    t_tr, t_sg, t_st, t_pt, t_bc, t_dy = tabs[:6]
+    if imap:
+        with tabs[6]:
+            _bt_by_index(trades, imap, capital, tf_min)
     with t_tr:
         st.dataframe(trades, use_container_width=True, hide_index=True)
         _csv_button("⬇ Trades CSV", trades, "backtest_trades", "bt_dl_trades")
@@ -1316,164 +1410,289 @@ def _bt_show(res, capital):
                "SL checked before target inside one candle. Live paper results can differ slightly.")
 
 
-def backtest_page():
-    """BACKTEST: same conditions as the Strategy Builder + From date / To date -> replay on historical candles."""
-    no_dim()
-    _ui_css()
-    h1, h2 = st.columns([6, 1])
-    h1.title("Backtest")
-    if h2.button("Logout", key="bt_logout", use_container_width=True):
-        for k_ in ("smart", "client_id", "creds"):
-            st.session_state.pop(k_, None)
-        st.session_state["no_autologin"] = True
-        st.rerun()
-    smart = st.session_state.get("smart")
+# ============================== SAVED STRATEGIES (folders -> files) ==============================
+# STRATEGIES_ROOT/<folder>/<file>.json       = name, saved time, setup (every input) and a small results summary
+# STRATEGIES_ROOT/<folder>/<file>.res.json   = the full result (trades, signals ...) - only read when a file is opened
+CREATE_FOLDER = "+ Create new folder"
+DEFAULT_FOLDER = "Unsorted"
+_RES_SUFFIX = ".res.json"
+
+
+def _safe_name(s, maxlen=60):
+    """Folder / file name safe for the disk (no slashes, no dots -> no path tricks, no clash with '.res.json')."""
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f.]+', " ", str(s or ""))
+    return re.sub(r"\s+", " ", s).strip()[:maxlen].strip()
+
+
+def _folder_dir(name):
+    name = _safe_name(name)
+    if not name:
+        return None
+    root = os.path.realpath(STRATEGIES_ROOT)
+    p = os.path.realpath(os.path.join(root, name))
+    return p if os.path.dirname(p) == root else None
+
+
+def _json_default(o):
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    if isinstance(o, (pd.Timestamp, datetime)):
+        return o.isoformat()
+    if isinstance(o, (set, tuple)):
+        return list(o)
+    return str(o)
+
+
+def _write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, default=_json_default)
+    os.replace(tmp, path)
+
+
+def _is_strategy_file(fn):
+    return fn.endswith(".json") and not fn.endswith(_RES_SUFFIX)
+
+
+def list_folders():
+    """[(folder name, number of files)] sorted by name."""
+    out = []
     try:
-        master = load_master()
-    except Exception as ex:
-        master = None
-        st.warning(f"Stock list load aagala ({ex}).")
+        for d in sorted(os.listdir(STRATEGIES_ROOT), key=str.lower):
+            p = os.path.join(STRATEGIES_ROOT, d)
+            if os.path.isdir(p):
+                out.append((d, sum(1 for f in os.listdir(p) if _is_strategy_file(f))))
+    except OSError:
+        pass
+    return out
 
-    today = now_ist().date()
-    with st.container(border=True):
-        e1, e2, e3 = st.columns(3)
-        exchange = e1.selectbox("Exchange", ["NSE", "BSE", "NFO", "MCX"], key="bt_exchange")
-        capital = e2.number_input("Capital", min_value=10000.0, value=None, step=10000.0, placeholder="Capital", key="bt_capital")
-        tf_label = e3.selectbox("Candle timeframe", list(TIMEFRAMES), index=None, placeholder="Select timeframe", key="bt_tf")
-        d1, d2, d3 = st.columns(3)
-        d_from = d1.date_input("From date", value=today - pd.Timedelta(days=30), max_value=today, key="bt_from")
-        d_to = d2.date_input("To date", value=today, max_value=today, key="bt_to")
-        precise = d3.checkbox("Accurate exits (1-minute candles - slower)", key="bt_precise",
-                              help="Off = target / SL checked on the chosen timeframe candles (fast). "
-                                   "On = checked on 1-minute candles like the live engine (more API calls).")
 
-        with st.container(border=True):
-            _section("Entry condition", "index, stocks, candle patterns, position size")
-            ix1, ix2, _b = st.columns(3)
-            with ix1:
-                index_pick = _stock_picker("Index", index_options(exchange), f"bt_index_{exchange}", button_label="Select index")
-            tf_min_ui = TIMEFRAMES[tf_label][1] if tf_label else None
-            g_starts, g_ends = tf_time_grid(exchange, tf_min_ui) if tf_label else ([], [])
-            entry_times = exit_at = ""
-            with ix2:
-                time_sel = _stock_picker("Time condition (optional)", ["Entry time", "Exit time"], "bt_timecond",
-                                         button_label="Select entry / exit time")
-            if time_sel:                                    # entry / exit time boxes appear ONLY after a time condition is chosen
-                tc1, tc2, _tc3 = st.columns(3)
-                if not tf_label:
-                    st.caption("⏱ Select the candle timeframe first - the times follow the timeframe.")
-                if "Entry time" in time_sel and tf_label:
-                    with tc1:
-                        if tf_min_ui < 1440:
-                            sel_times = _stock_picker("Entry time", g_starts, f"bt_etimes_{exchange}_{tf_min_ui}",
-                                                      button_label="Select entry time")
-                            entry_times = ",".join(sel_times)
-                        else:
-                            st.caption("⏱ 1-day candles always enter at the session open.")
-                if "Exit time" in time_sel and tf_label:
-                    default_x = exit_time(exchange).strftime("%H:%M")
-                    x_opts = sorted(set(g_ends) | {default_x})
-                    exit_at = tc2.selectbox("Exit time (square-off)", x_opts, index=x_opts.index(default_x),
-                                            key=f"bt_exit_{exchange}_{tf_min_ui}",
-                                            help="Open trades still running are closed at this time (on the last day of Max hold).")
-            items = []
-            if master is not None:
-                inst = exchange_list_cached(exchange, index_pick)
-                labels = inst["label"].tolist()
-                by_label = inst.set_index("label")
-                ix_name = " + ".join(index_pick) if len(index_pick) <= 2 else f"{len(index_pick)} indices"
-                picked = _stock_picker(f"{ix_name or exchange} stocks ({len(labels)})", labels,
-                                       f"bt_stocks_{exchange}_{'+'.join(index_pick) or 'all'}",
-                                       default=labels if index_pick else None)
-                typed = st.text_input("Or type names (comma separated)", key="bt_typed")
-                names, miss = list(picked), []
-                for t in [x.strip().upper() for x in typed.split(",") if x.strip()]:
-                    hit = inst[(inst["label"].str.upper() == t) | (inst["symbol"].str.upper() == t)
-                               | (inst["name"].str.upper() == t)]
-                    if hit.empty:
-                        miss.append(t)
-                    elif hit.iloc[0]["label"] not in names:
-                        names.append(hit.iloc[0]["label"])
-                if miss:
-                    st.warning("Not found in " + exchange + ": " + ", ".join(miss))
-                items = [to_item({**by_label.loc[n].to_dict(), "label": n}, exchange) for n in names]
-                st.caption(f"✅ Total {len(items)} stocks selected (of {len(labels)} in the chosen index list)")
-            picked_pats = _stock_picker(f"Candle patterns ({len(PATTERNS)})", list(PATTERNS), "bt_patterns",
-                                        default=list(PATTERNS), button_label="Select candle patterns")
-            cl1, _c2, _c3 = st.columns(3)
-            with cl1:
-                cloud_sel = _stock_picker("Ichimoku cloud (optional)", [CLOUD_LABEL[k] for k in CLOUD_OPTIONS],
-                                          "bt_cloud", button_label="Select cloud position (optional)")
-            cloud_pick = cloud_text([CLOUD_BY_LABEL[x] for x in cloud_sel])
+def list_files(folder):
+    """Saved files of one folder (newest first) - only the small header file of each is read."""
+    d = _folder_dir(folder)
+    rows = []
+    if not d or not os.path.isdir(d):
+        return rows
+    for fn in os.listdir(d):
+        if not _is_strategy_file(fn):
+            continue
+        try:
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            continue
+        meta["file"] = fn[:-5]
+        meta.setdefault("name", meta["file"])
+        rows.append(meta)
+    rows.sort(key=lambda m: str(m.get("saved_at", "")), reverse=True)
+    return rows
 
-            NO_LIMIT = "Select max (no limit)"
-            m1, m2, m3 = st.columns(3)
-            max_pick = m1.selectbox("Max open positions", [NO_LIMIT] + list(range(1, 26)) + [30, 40, 50], index=0, key="bt_max")
-            no_limit = max_pick == NO_LIMIT
-            max_open = 10 ** 6 if no_limit else int(max_pick)
-            size_mode, position_amount, position_qty = _sizing_inputs(
-                m2, m3, capital, max_open, no_limit, len(items), "bt",
-                default_amt=None if (no_limit or not capital) else round(capital / max_open, 2))
 
-        with st.container(border=True):
-            _section("Exit condition", "target, optional stop loss / holding days")
-            x1, x2, x3 = st.columns(3)
-            target_pct = x1.number_input("Target (%)", min_value=0.01, value=None, step=0.01, format="%.2f",
-                                         placeholder="Target %", key="bt_target")
-            sl_pct = x2.number_input("Stop loss (%) - optional", min_value=0.0, value=0.0, step=0.1, format="%.2f", key="bt_sl")
-            max_hold = x3.number_input("Max hold (days)", min_value=1, value=MAX_HOLD_DAYS, step=1, key="bt_hold",
-                                       help="1 = same-day square-off at 15:15 (NSE) / 23:15 (MCX) - or the Exit time chosen in Time condition.")
-        run = st.button("▶ Run backtest", type="primary", key="bt_run")
+def _df_pack(df):
+    if df is None:
+        return None
+    df = df.copy()
+    for c in df.columns:                                       # timestamps are stored as IST-naive text
+        if pd.api.types.is_datetime64_any_dtype(df[c]) and getattr(df[c].dt, "tz", None) is not None:
+            df[c] = df[c].dt.tz_convert(IST).dt.tz_localize(None)
+    dt = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c])]
+    return {"dt": dt, "df": json.loads(df.to_json(orient="split", date_format="iso", date_unit="ms",
+                                                  index=False, default_handler=str))}
 
-    if run:
-        missing = [n for n, v in (("Capital", capital), ("Candle timeframe", tf_label),
-                                  (SIZE_LABELS[size_mode], position_qty if size_mode == "qty" else position_amount),
-                                  ("Target %", target_pct)) if not v]
-        if missing:
-            st.error("Fill: " + ", ".join(missing))
-        elif d_from > d_to:
-            st.error("From date must be on or before To date.")
-        elif entry_times and exit_at and exit_at <= min(entry_times.split(",")):
-            st.error("Exit time must be after the earliest Entry time.")
-        elif not items:
-            st.error("Stocks select pannunga.")
-        elif not picked_pats:
-            st.error("Candle patterns select pannunga.")
-        elif smart is None:
-            st.error("Angel One login illa (historical data-ku login venum).")
+
+def _df_unpack(p):
+    if not p:
+        return pd.DataFrame()
+    df = pd.DataFrame(p["df"]["data"], columns=p["df"]["columns"])
+    for c in p.get("dt", []):
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    for c in df.columns:                                       # numbers that came back as object (None mixed in)
+        if df[c].dtype == object:
+            nn = df[c].dropna()
+            if len(nn) and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in nn):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def save_strategy(folder, fname, setup, res):
+    """Create / replace folder/file. Returns True when an existing file was replaced."""
+    d, stem = _folder_dir(folder), _safe_name(fname)
+    if not d or not stem:
+        raise ValueError("Folder name and file name are needed.")
+    os.makedirs(d, exist_ok=True)
+    main, resf = os.path.join(d, stem + ".json"), os.path.join(d, stem + _RES_SUFFIX)
+    existed = os.path.exists(main)
+    summary = None
+    if res is not None:
+        trades = res["trades"]
+        if trades is not None and not trades.empty:
+            s = bt_stats(trades, res["capital"])
+            summary = {k: s[k] for k in ("net", "ret", "n", "win_rate", "pf")}
         else:
-            interval, tf_min = TIMEFRAMES[tf_label]
-            data = {"exchange": exchange, "items": items, "capital": float(capital), "interval": interval, "tf_min": tf_min,
-                    "max_open": int(max_open), "no_limit": no_limit, "position_amount": float(position_amount or 0),
-                    "size_mode": size_mode, "position_qty": int(position_qty or 0), "target_pct": float(target_pct),
-                    "sl_pct": float(sl_pct or 0), "max_hold": int(max_hold), "patterns": list(picked_pats),
-                    "cloud_filter": cloud_pick,
-                    "entry_times": entry_times, "exit_at": exit_at}
-            cfg = _cfg_from_data(data)
-            cfg.slippage_pct, cfg.brokerage_pct = 0.0, 0.0          # costs removed from the UI
-            bar = st.progress(0.0, text="Loading history...")
-
-            def _prog(n, total, sym):
-                bar.progress(n / total, text=f"Loading history {n}/{total}  ({sym})")
-
-            res = run_backtest(smart, cfg, items, exchange, d_from, d_to, precise, _prog)
-            bar.empty()
-            res["capital"] = float(capital)
-            res["label"] = (f"{exchange} | {tf_label} | {d_from:%d %b %Y} → {d_to:%d %b %Y} | "
-                            f"{len(items)} stocks | target {target_pct}%"
-                            + (f" | entry at {entry_times.replace(',', ', ')}" if entry_times else "")
-                            + (f" | exit {exit_at}" if exit_at else ""))
-            st.session_state["bt_result"] = res
-
-    res = st.session_state.get("bt_result")
-    if res:
-        st.subheader("Result")
-        st.caption(res["label"])
-        _bt_show(res, res["capital"])
+            summary = {"n": 0}
+        _write_json(resf, {"trades": _df_pack(trades), "signals": _df_pack(res.get("signals")),
+                           "errors": list(res.get("errors") or []), "tf_min": res.get("tf_min"),
+                           "capital": res.get("capital"), "label": res.get("label"),
+                           "index_map": res.get("index_map") or {}})
+    elif os.path.exists(resf):
+        os.remove(resf)                                        # replaced by a setup-only save -> no stale result
+    _write_json(main, {"name": stem, "saved_at": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+                       "setup": setup, "summary": summary, "has_result": res is not None})
+    return existed
 
 
+def load_strategy(folder, stem):
+    """-> (header dict, result dict or None)"""
+    d = _folder_dir(folder)
+    if not d or os.path.basename(stem) != stem:
+        raise ValueError("Bad file name.")
+    with open(os.path.join(d, stem + ".json"), encoding="utf-8") as f:
+        meta = json.load(f)
+    res, rp = None, os.path.join(d, stem + _RES_SUFFIX)
+    if meta.get("has_result") and os.path.exists(rp):
+        with open(rp, encoding="utf-8") as f:
+            r = json.load(f)
+        res = {"trades": _df_unpack(r.get("trades")), "signals": _df_unpack(r.get("signals")),
+               "errors": r.get("errors") or [], "tf_min": r.get("tf_min") or 5, "capital": r.get("capital"),
+               "label": r.get("label") or "", "index_map": r.get("index_map") or {}, "setup": meta.get("setup")}
+    return meta, res
 
-# ============================== LOGIN (Angel One - needed only to download history) ==============================
+
+def _cb_open_strategy(folder, stem, with_result):
+    """Open = setup + saved result back on the Backtest page.  Edit = only the setup (change it, run again, save over it)."""
+    ss = st.session_state
+    try:
+        meta, res = load_strategy(folder, stem)
+    except Exception as ex:
+        ss["sf_msg"] = ("error", f"Could not open the file: {ex}")
+        return
+    ss["bt_restore"] = {**(meta.get("setup") or {}), "_folder": folder, "_file": meta.get("name", stem)}
+    ss["bt_gen"] = ss.get("bt_gen", 0) + 1                    # new widget keys -> the form starts from the saved values
+    ss.pop("bt_index_filter", None)
+    if with_result and res is not None:
+        ss["bt_result"] = res
+    else:
+        ss.pop("bt_result", None)
+        if with_result:
+            ss["sf_msg"] = ("info", "This file was saved without a result - opened for editing.")
+    ss["bt_view"] = "backtest"
+
+
+def _cb_delete_strategy(folder, stem):
+    d = _folder_dir(folder)
+    if d and os.path.basename(stem) == stem:
+        for suf in (".json", _RES_SUFFIX):
+            try:
+                os.remove(os.path.join(d, stem + suf))
+            except OSError:
+                pass
+    st.session_state["sf_msg"] = ("success", f"Deleted {stem}.")
+
+
+def _cb_new_folder():
+    ss = st.session_state
+    nm = _safe_name(ss.get("sf_new_name"))
+    d = _folder_dir(nm)
+    if not d:
+        ss["sf_msg"] = ("error", "Enter a folder name.")
+    elif os.path.exists(d):
+        ss["sf_msg"] = ("error", f"Folder '{nm}' already exists.")
+    else:
+        os.makedirs(d)
+        ss["sf_sel"] = nm
+        ss["sf_new_name"] = ""
+
+
+def _cb_rename_folder(old):
+    ss = st.session_state
+    nm = _safe_name(ss.get(f"sf_ren_{old}"))
+    a, b = _folder_dir(old), _folder_dir(nm)
+    if not b:
+        ss["sf_msg"] = ("error", "Enter a folder name.")
+    elif nm == old:
+        return
+    elif os.path.exists(b) and os.path.normcase(a) != os.path.normcase(b):
+        ss["sf_msg"] = ("error", f"Folder '{nm}' already exists.")
+    else:
+        os.rename(a, b)
+        ss["sf_sel"] = nm
+
+
+def _cb_delete_folder(name):
+    d = _folder_dir(name)
+    if d and os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
+    st.session_state.pop("sf_sel", None)
+    st.session_state["sf_msg"] = ("success", f"Deleted folder {name}.")
+
+
+# ============================== LOGIN STORAGE (several saved Angel One logins) ==============================
+SAVED_LOGINS_FILE = os.path.join(_DATA_DIR, "angel_logins.json")
+OLD_LOGIN_FILE = os.path.join(_DATA_DIR, "angel_login.json")          # single login of the older version (migrated once)
+_LOGIN_KEYS = ("api_key", "client_id", "mpin", "totp_secret")
+
+
+def _write_logins(rows):
+    tmp = SAVED_LOGINS_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)      # readable by the current user only
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(rows, f)
+    os.replace(tmp, SAVED_LOGINS_FILE)
+    os.chmod(SAVED_LOGINS_FILE, 0o600)
+
+
+def _migrate_old_login():
+    try:
+        with open(OLD_LOGIN_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        row = {k: str(d.get(k, "")).strip() for k in _LOGIN_KEYS}
+        if not all(row.values()):
+            return []
+        row["last_used"] = datetime.fromtimestamp(os.path.getmtime(OLD_LOGIN_FILE)).strftime("%Y-%m-%d %H:%M:%S")
+        _write_logins([row])
+        os.remove(OLD_LOGIN_FILE)
+        return [row]
+    except Exception:
+        return []
+
+
+def list_saved_logins():
+    """Saved logins, most recently used first."""
+    try:
+        with open(SAVED_LOGINS_FILE, encoding="utf-8") as f:
+            rows = json.load(f)
+    except FileNotFoundError:
+        rows = _migrate_old_login()
+    except Exception:
+        rows = []
+    rows = [r for r in rows if isinstance(r, dict) and all(str(r.get(k, "")).strip() for k in _LOGIN_KEYS)]
+    return sorted(rows, key=lambda r: str(r.get("last_used", "")), reverse=True)
+
+
+def save_login(creds):
+    """Add (or refresh) one login and stamp it as used now."""
+    try:
+        row = {k: str(v).strip() for k, v in zip(_LOGIN_KEYS, creds)}
+        row["client_id"] = row["client_id"].upper()
+        row["last_used"] = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+        rows = [r for r in list_saved_logins() if str(r["client_id"]).upper() != row["client_id"].upper()]
+        _write_logins(rows + [row])
+    except Exception:
+        pass
+
+
+def remove_saved_login(client_id):
+    try:
+        _write_logins([r for r in list_saved_logins() if str(r["client_id"]).upper() != str(client_id).upper()])
+    except Exception:
+        pass
+
+
 def env_creds():
     c = tuple(os.getenv(k, "").strip() for k in ("ANGEL_API_KEY", "ANGEL_CLIENT_ID", "ANGEL_MPIN", "ANGEL_TOTP_SECRET"))
     if all(c):
@@ -1488,36 +1707,542 @@ def env_creds():
     return None
 
 
+def _last_used_text(stamp):
+    try:
+        d = datetime.strptime(str(stamp)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return "earlier"
+    return "today" if d == now_ist().date() else f"{d.day} {d:%b}"
+
+
+AVATARS = (("#7db4ff", "#0b2a52"), ("#22b23a", "#12301a"), ("#f0a020", "#3a2410"))      # (text, background)
+
+
+def _connect(creds, remember):
+    ss = st.session_state
+    with st.spinner("Angel One login..."):
+        sm, err = angel_login(*creds)
+    if sm is None:
+        st.error(err)
+        return
+    ss.smart, ss.client_id, ss.creds = sm, str(creds[1]).strip().upper(), tuple(creds)
+    ss.pop("no_autologin", None)
+    ss.pop("login_new", None)
+    if remember:
+        save_login(creds)                                      # new login is added / a saved one gets "last used: today"
+    st.rerun()
+
+
 def login_page():
     no_dim()
+    ss = st.session_state
     st.title("Angel One login")
     st.caption("Login is used only to download historical candles. No orders are placed.")
-    ss = st.session_state
-    with st.form("angel_login"):
-        api_key = st.text_input("API key", type="password")
-        client_id = st.text_input("Client ID")
-        mpin = st.text_input("MPIN", type="password")
-        totp = st.text_input("TOTP secret", type="password")
-        go = st.form_submit_button("Connect", type="primary")
+    saved = list_saved_logins()
+    if not saved:
+        ss["login_new"] = True                                 # nobody saved yet -> normal login form directly
+    if not ss.get("login_new"):
+        with st.container(border=True):
+            st.markdown("<div style='opacity:.85;margin-bottom:.2rem'>Saved logins</div>", unsafe_allow_html=True)
+            for i, r in enumerate(saved):
+                cid = str(r["client_id"]).strip()
+                fg, bg = AVATARS[int(hashlib.md5(cid.upper().encode()).hexdigest(), 16) % len(AVATARS)]
+                ini = html.escape(re.sub(r"[^A-Za-z0-9]", "", cid)[:2].upper() or "?")
+                st.divider()
+                c_av, c_info, c_go, c_del = st.columns([0.6, 5, 1.6, 0.6], vertical_alignment="center")
+                c_av.markdown(f"<div style='width:46px;height:46px;border-radius:50%;background:{bg};color:{fg};"
+                              f"display:flex;align-items:center;justify-content:center;font-weight:700'>{ini}</div>",
+                              unsafe_allow_html=True)
+                c_info.markdown(f"<div style='font-weight:700;font-size:1.05rem;line-height:1.3'>{html.escape(cid)}</div>"
+                                f"<div style='opacity:.65;font-size:.92rem'>Last used {_last_used_text(r.get('last_used'))}</div>",
+                                unsafe_allow_html=True)
+                if c_go.button("🔑 Login", key=f"sl_go_{cid}", use_container_width=True):
+                    _connect(tuple(str(r[k]).strip() for k in _LOGIN_KEYS), True)
+                if c_del.button("🗑", key=f"sl_del_{cid}", type="tertiary", help="Remove this saved login"):
+                    remove_saved_login(cid)
+                    st.rerun()
+            st.divider()
+            if st.button("➕ Login with new account", key="sl_new", use_container_width=True):
+                ss["login_new"] = True
+                st.rerun()
+        return
+    with st.container(border=True):
+        if saved and st.button("← Back to saved logins", key="sl_back", type="tertiary"):
+            ss.pop("login_new", None)
+            st.rerun()
+        with st.form("angel_login", border=False):
+            f1, f2, f3, f4 = st.columns(4)
+            api_key = f1.text_input("API key", type="password")
+            client_id = f2.text_input("Client ID", placeholder="S12345")
+            mpin = f3.text_input("MPIN", type="password")
+            totp = f4.text_input("TOTP secret", type="password")
+            remember = st.checkbox("Remember this login on this device", value=True)
+            go = st.form_submit_button("🔗 Connect", type="primary")
     if go:
         if not all(x.strip() for x in (api_key, client_id, mpin, totp)):
             st.error("Fill all 4 fields.")
             return
-        with st.spinner("Angel One login..."):
-            sm, err = angel_login(api_key, client_id, mpin, totp)
-        if sm is None:
-            st.error(err)
-            return
-        ss.smart, ss.client_id, ss.creds = sm, client_id.strip().upper(), (api_key, client_id, mpin, totp)
-        ss.pop("no_autologin", None)
+        _connect((api_key, client_id, mpin, totp), remember)
+
+
+# ============================== APP HEADER (title + Backtest / Strategies tabs + Logout) ==============================
+def _app_header():
+    ss = st.session_state
+    view = ss.get("bt_view", "backtest")
+    c0, c1, c2, _sp, c3 = st.columns([2.2, 1.5, 1.7, 3.6, 1.1], vertical_alignment="center")
+    c0.markdown("<div style='font-size:1.55rem;font-weight:700;white-space:nowrap'>Backtest app</div>", unsafe_allow_html=True)
+    if c1.button("🧪 Backtest", key="nav_backtest", type="primary" if view == "backtest" else "tertiary",
+                 use_container_width=True) and view != "backtest":
+        ss["bt_view"] = "backtest"
         st.rerun()
+    if c2.button("📁 Strategies", key="nav_strategies", type="primary" if view == "strategies" else "tertiary",
+                 use_container_width=True) and view != "strategies":
+        ss["bt_view"] = "strategies"
+        st.rerun()
+    if c3.button("Logout", key="bt_logout", type="tertiary", use_container_width=True):
+        for k_ in ("smart", "client_id", "creds"):
+            ss.pop(k_, None)
+        ss["no_autologin"] = True                              # back to the login page - saved logins are kept
+        ss.pop("login_new", None)
+        st.rerun()
+    st.divider()
+
+
+# ============================== BACKTEST PAGE ==============================
+# ============================== BULK STOCK NAMES FROM A FILE (Excel / CSV / TXT) ==============================
+_NAME_HEADERS = ("symbol", "stock", "name", "script", "scrip", "company", "instrument", "ticker")
+
+
+def read_stock_names(upload):
+    """Stock names from an uploaded Excel / CSV / TXT file.
+       Excel: first sheet; the column whose header says symbol / stock / name ... (else the first column).
+       CSV / TXT: every value split by new line, comma, semicolon or tab."""
+    raw, fname = upload.getvalue(), upload.name.lower()
+    if fname.endswith((".xlsx", ".xlsm", ".xls")):
+        try:
+            df = pd.read_excel(io.BytesIO(raw), header=None, dtype=str)
+        except ImportError:
+            raise RuntimeError("Excel reading needs openpyxl - run: pip install openpyxl")
+        if df.empty:
+            return []
+        col, start = 0, 0
+        for j in range(df.shape[1]):
+            h = str(df.iat[0, j]).strip().lower()
+            if any(k in h for k in _NAME_HEADERS):
+                col, start = j, 1
+                break
+        vals = df.iloc[start:, col].tolist()
+    else:
+        text = raw.decode("utf-8-sig", errors="ignore")
+        vals = re.split(r"[\n\r,;\t]+", text)
+    out, seen = [], set()
+    for v in vals:
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            continue
+        v = str(v).strip()
+        if v and v.lower() != "nan" and v.upper() not in seen:
+            seen.add(v.upper())
+            out.append(v)
+    return out[:3000]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def exchange_universe(exchange):
+    """EVERY tradable name of the exchange (not only the chosen index) - used to match uploaded names."""
+    d = load_master()
+    d = d[d["exch_seg"] == exchange].copy()
+    nm = d["name"].fillna("").astype(str)
+    sy = d["symbol"].fillna("").astype(str)
+    if exchange == "NSE":
+        d = d[sy.str.upper().str.endswith("-EQ")]
+        d["label"] = d["name"]
+    elif exchange == "BSE":
+        d["label"] = d["symbol"]
+    else:
+        itype = d["instrumenttype"].fillna("") if "instrumenttype" in d else pd.Series("", index=d.index)
+        d = d[itype.str.startswith("FUT")].copy()
+        d["exp"] = pd.to_datetime(d["expiry"], format="%d%b%Y", errors="coerce")
+        d = d[d["exp"] >= pd.Timestamp.now().normalize()].sort_values("exp").drop_duplicates("name")
+        d["label"] = d["symbol"]
+    return d.drop_duplicates("label").reset_index(drop=True)
+
+
+def match_stock_names(names, uni):
+    """-> (matched master rows, names not found). Matches name, symbol or symbol without -EQ (case-insensitive)."""
+    lk = {}
+    for i, (lb, sy, nm) in enumerate(zip(uni["label"], uni["symbol"], uni["name"])):
+        for k in (lb, sy, nm, re.sub(r"-EQ$", "", str(sy).upper())):
+            k = str(k).upper().strip()
+            if k and k not in lk:
+                lk[k] = i
+    rows, miss, seen = [], [], set()
+    for raw in names:
+        key = re.sub(r"^(NSE|BSE|NFO|MCX)\s*:\s*", "", raw.upper().strip())
+        key = re.sub(r"\.(NS|BO|BSE|NSE)$", "", key)
+        i = lk.get(key)
+        if i is None:
+            i = lk.get(key + "-EQ")
+        if i is None:
+            miss.append(raw)
+        elif i not in seen:
+            seen.add(i)
+            rows.append(uni.iloc[i].to_dict())
+    return rows, miss
+
+
+def _date_or(s, default):
+    """Saved ISO date -> date (never later than today); falls back to the default."""
+    try:
+        return min(datetime.strptime(str(s)[:10], "%Y-%m-%d").date(), now_ist().date())
+    except (TypeError, ValueError):
+        return default
+
+
+def backtest_page():
+    """BACKTEST: same conditions as the Strategy Builder + From date / To date -> replay on historical candles."""
+    ss = st.session_state
+    g = ss.get("bt_gen", 0)                                   # +1 every time a saved file is opened / edited -> fresh widgets
+    R = ss.get("bt_restore") or {}                            # saved setup (empty = normal blank form)
+    K = lambda name: f"{name}_g{g}"
+    smart = ss.get("smart")
+    try:
+        master = load_master()
+    except Exception as ex:
+        master = None
+        st.warning(f"Stock list load aagala ({ex}).")
+
+    save_box = st.container(border=True)                      # SAVE TO FOLDER sits at the very top; filled in below
+    today = now_ist().date()
+    EXCH = ["NSE", "BSE", "NFO", "MCX"]
+    TF_OPTS = list(TIMEFRAMES)
+    picked, typed, sel_times, time_sel, up_labels = [], "", [], [], []
+    with st.container(border=True):
+        e1, e2, e3 = st.columns(3)
+        exchange = e1.selectbox("Exchange", EXCH, index=EXCH.index(R["exchange"]) if R.get("exchange") in EXCH else 0,
+                                key=K("bt_exchange"))
+        capital = e2.number_input("Capital", min_value=10000.0, value=float(R["capital"]) if R.get("capital") else None,
+                                  step=10000.0, placeholder="Capital", key=K("bt_capital"))
+        tf_label = e3.selectbox("Candle timeframe", TF_OPTS, index=TF_OPTS.index(R["tf_label"]) if R.get("tf_label") in TF_OPTS else None,
+                                placeholder="Select timeframe", key=K("bt_tf"))
+        rx = R if R.get("exchange") == exchange else {}       # saved values that belong to the chosen exchange
+        d1, d2, d3 = st.columns(3)
+        d_from = d1.date_input("From date", value=_date_or(R.get("d_from"), today - pd.Timedelta(days=30)), max_value=today, key=K("bt_from"))
+        d_to = d2.date_input("To date", value=_date_or(R.get("d_to"), today), max_value=today, key=K("bt_to"))
+        precise = d3.checkbox("Accurate exits (1-minute candles - slower)", value=bool(R.get("precise")), key=K("bt_precise"),
+                              help="Off = target / SL checked on the chosen timeframe candles (fast). "
+                                   "On = checked on 1-minute candles like the live engine (more API calls).")
+
+        with st.container(border=True):
+            _section("Entry condition", "index, stocks, candle patterns, position size")
+            ix1, ix2, _b = st.columns(3)
+            with ix1:
+                index_pick = _stock_picker("Index", index_options(exchange), K(f"bt_index_{exchange}"),
+                                           default=rx.get("index_pick"), button_label="Select index")
+            tf_min_ui = TIMEFRAMES[tf_label][1] if tf_label else None
+            g_starts, g_ends = tf_time_grid(exchange, tf_min_ui) if tf_label else ([], [])
+            entry_times = exit_at = ""
+            rt = rx if rx.get("tf_label") == tf_label else {}
+            with ix2:
+                time_sel = _stock_picker("Time condition (optional)", ["Entry time", "Exit time"], K("bt_timecond"),
+                                         default=R.get("time_sel"), button_label="Select entry / exit time")
+            if time_sel:                                    # entry / exit time boxes appear ONLY after a time condition is chosen
+                tc1, tc2, _tc3 = st.columns(3)
+                if not tf_label:
+                    st.caption("⏱ Select the candle timeframe first - the times follow the timeframe.")
+                if "Entry time" in time_sel and tf_label:
+                    with tc1:
+                        if tf_min_ui < 1440:
+                            sel_times = _stock_picker("Entry time", g_starts, K(f"bt_etimes_{exchange}_{tf_min_ui}"),
+                                                      default=rt.get("entry_sel"), button_label="Select entry time")
+                            entry_times = ",".join(sel_times)
+                        else:
+                            st.caption("⏱ 1-day candles always enter at the session open.")
+                if "Exit time" in time_sel and tf_label:
+                    default_x = exit_time(exchange).strftime("%H:%M")
+                    x_opts = sorted(set(g_ends) | {default_x})
+                    x_def = rt.get("exit_at") if rt.get("exit_at") in x_opts else default_x
+                    exit_at = tc2.selectbox("Exit time (square-off)", x_opts, index=x_opts.index(x_def),
+                                            key=K(f"bt_exit_{exchange}_{tf_min_ui}"),
+                                            help="Open trades still running are closed at this time (on the last day of Max hold).")
+            items, index_map = [], {}
+            if master is not None:
+                inst = exchange_list_cached(exchange, index_pick)
+                labels = inst["label"].tolist()
+                by_label = inst.set_index("label")
+                ix_name = " + ".join(index_pick) if len(index_pick) <= 2 else f"{len(index_pick)} indices"
+                r_picked = rx.get("picked") if (rx and rx.get("index_pick", []) == list(index_pick)) else None
+                picked = _stock_picker(f"{ix_name or exchange} stocks ({len(labels)})", labels,
+                                       K(f"bt_stocks_{exchange}_{'+'.join(index_pick) or 'all'}"),
+                                       default=r_picked if r_picked is not None else (labels if index_pick else None))
+                typed = st.text_input("Or type names (comma separated)", value=rx.get("typed", ""), key=K("bt_typed"))
+                up = st.file_uploader("Or upload an Excel / CSV file with stock names", type=["xlsx", "xls", "csv", "txt"],
+                                      key=K("bt_upload"),
+                                      help="One stock name or symbol per row in the first column (a header row is optional). "
+                                           "Any stock of the chosen exchange works - it does not have to be in the selected index. "
+                                           "Excel: first sheet is read.")
+                up_rows, up_miss = [], []
+                if up is not None:
+                    try:
+                        up_rows, up_miss = match_stock_names(read_stock_names(up), exchange_universe(exchange))
+                    except Exception as ex:
+                        st.error(f"Could not read the file: {ex}")
+                    if up_rows or up_miss:
+                        st.caption(f"📄 {up.name}: {len(up_rows)} stocks matched" + (f", {len(up_miss)} not found" if up_miss else ""))
+                    if up_miss:
+                        with st.expander(f"{len(up_miss)} names not found in {exchange}"):
+                            st.write(", ".join(up_miss[:200]) + (" ..." if len(up_miss) > 200 else ""))
+                elif rx.get("upload_names"):
+                    if st.checkbox(f"Use the {len(rx['upload_names'])} stocks from the file saved with this strategy (upload a new file to replace them)",
+                                   value=True, key=K("bt_use_saved_up")):
+                        uni_ = exchange_universe(exchange)
+                        by_lb_ = {r["label"]: r for r in uni_.to_dict("records")}
+                        up_rows = [by_lb_[x] for x in rx["upload_names"] if x in by_lb_]
+                up_labels = [r["label"] for r in up_rows]
+                names, miss = list(picked), []
+                for t in [x.strip().upper() for x in typed.split(",") if x.strip()]:
+                    hit = inst[(inst["label"].str.upper() == t) | (inst["symbol"].str.upper() == t)
+                               | (inst["name"].str.upper() == t)]
+                    if hit.empty:
+                        miss.append(t)
+                    elif hit.iloc[0]["label"] not in names:
+                        names.append(hit.iloc[0]["label"])
+                if miss:
+                    st.warning("Not found in " + exchange + ": " + ", ".join(miss))
+                items = [to_item({**by_label.loc[n].to_dict(), "label": n}, exchange) for n in names]
+                have_ = {it["symbol"] for it in items}
+                for r_ in up_rows:                                  # stocks from the uploaded file (added to the picked / typed ones)
+                    if r_["label"] not in have_:
+                        have_.add(r_["label"])
+                        items.append(to_item(r_, exchange))
+                index_map = build_index_map(items, exchange, index_pick) if len(index_pick) >= 2 else {}
+                st.caption(f"✅ Total {len(items)} stocks selected (of {len(labels)} in the chosen index list)")
+            picked_pats = _stock_picker(f"Candle patterns ({len(PATTERNS)})", list(PATTERNS), K("bt_patterns"),
+                                        default=R.get("patterns") or list(PATTERNS), button_label="Select candle patterns")
+            cl1, _c2, _c3 = st.columns(3)
+            with cl1:
+                cloud_sel = _stock_picker("Ichimoku cloud (optional)", [CLOUD_LABEL[k] for k in CLOUD_OPTIONS],
+                                          K("bt_cloud"), default=R.get("cloud_sel"), button_label="Select cloud position (optional)")
+            cloud_pick = cloud_text([CLOUD_BY_LABEL[x] for x in cloud_sel])
+
+            NO_LIMIT = "Select max (no limit)"
+            MAX_OPTS = [NO_LIMIT] + list(range(1, 26)) + [30, 40, 50]
+            m1, m2, m3 = st.columns(3)
+            max_pick = m1.selectbox("Max open positions", MAX_OPTS,
+                                    index=MAX_OPTS.index(R["max_pick"]) if R.get("max_pick") in MAX_OPTS else 0, key=K("bt_max"))
+            no_limit = max_pick == NO_LIMIT
+            max_open = 10 ** 6 if no_limit else int(max_pick)
+            def_amt = None if (no_limit or not capital) else round(capital / max_open, 2)
+            if (R.get("size_mode") == "amount" and R.get("position_amount") and capital
+                    and float(capital) == float(R.get("capital") or 0) and max_pick == R.get("max_pick")):
+                def_amt = float(R["position_amount"])         # saved amount stays until capital / max positions change
+            size_mode, position_amount, position_qty = _sizing_inputs(
+                m2, m3, capital, max_open, no_limit, len(items), K("bt"),
+                cur_mode=R.get("size_mode") or "amount", default_amt=def_amt, cur_qty=R.get("position_qty"))
+
+        with st.container(border=True):
+            _section("Exit condition", "target, optional stop loss / holding days")
+            x1, x2, x3 = st.columns(3)
+            target_pct = x1.number_input("Target (%)", min_value=0.01, value=float(R["target_pct"]) if R.get("target_pct") else None,
+                                         step=0.01, format="%.2f", placeholder="Target %", key=K("bt_target"))
+            sl_pct = x2.number_input("Stop loss (%) - optional", min_value=0.0, value=float(R.get("sl_pct") or 0.0), step=0.1,
+                                     format="%.2f", key=K("bt_sl"))
+            max_hold = x3.number_input("Max hold (days)", min_value=1, value=int(R.get("max_hold") or MAX_HOLD_DAYS), step=1,
+                                       key=K("bt_hold"),
+                                       help="1 = same-day square-off at 15:15 (NSE) / 23:15 (MCX) - or the Exit time chosen in Time condition.")
+            cx1, _cx2, _cx3 = st.columns(3)
+            with cx1:
+                cloud_exit_sel = _stock_picker("Ichimoku cloud exit (optional)", [CLOUD_LABEL[k] for k in CLOUD_OPTIONS],
+                                               K("bt_cloud_exit"), default=R.get("cloud_exit_sel"),
+                                               button_label="Select cloud exit position (optional)")
+            cloud_exit_pick = cloud_text([CLOUD_BY_LABEL[x] for x in cloud_exit_sel])
+            if cloud_exit_pick:
+                st.caption("Exit at the CLOSE of the first candle that closes " + " / ".join(CLOUD_LABEL[k].lower() for k in cloud_list(cloud_exit_pick))
+                           + " - if target / stop loss is not hit first.")
+        run = st.button("▶ Run backtest", type="primary", key=K("bt_run"))
+
+    # everything the form holds right now - saved with the file so Open / Edit can bring it back
+    setup = {"exchange": exchange, "capital": float(capital) if capital else None, "tf_label": tf_label,
+             "d_from": d_from.isoformat(), "d_to": d_to.isoformat(), "precise": bool(precise),
+             "index_pick": list(index_pick), "time_sel": list(time_sel), "entry_sel": list(sel_times), "exit_at": exit_at,
+             "picked": list(picked), "typed": typed, "upload_names": list(up_labels), "patterns": list(picked_pats), "cloud_sel": list(cloud_sel),
+             "max_pick": max_pick, "size_mode": size_mode,
+             "position_amount": float(position_amount) if position_amount else None,
+             "position_qty": int(position_qty) if position_qty else None,
+             "target_pct": float(target_pct) if target_pct else None, "sl_pct": float(sl_pct or 0),
+             "max_hold": int(max_hold), "cloud_exit_sel": list(cloud_exit_sel)}
+
+    # ---------------- WHERE THE RESULT IS SAVED (top of the page) - the save itself happens after Run backtest ----------------
+    with save_box:
+        st.markdown("<span style='font-size:1.05rem'>📁 <b>Folder and file</b></span>"
+                    "<span style='opacity:.7'> &nbsp;(optional, the setup and its result are saved to Strategies after Run backtest)</span>",
+                    unsafe_allow_html=True)
+        f1, f2, f3 = st.columns(3)
+        folder_names = [n for n, _ in list_folders()]
+        f_opts = [CREATE_FOLDER] + folder_names
+        folder_pick = f1.selectbox("Folder", f_opts, index=f_opts.index(R["_folder"]) if R.get("_folder") in f_opts else 0,
+                                   key=K("sv_folder"))
+        creating = folder_pick == CREATE_FOLDER
+        new_folder = f2.text_input("New folder name (only when creating)", placeholder="Bank stocks",
+                                   disabled=not creating, key=K("sv_newfolder"))
+        file_name = f3.text_input("File name", value=R.get("_file", ""), placeholder="Engulfing cloud above", key=K("sv_file"))
+
+    if run:
+        missing = [n for n, v in (("Capital", capital), ("Candle timeframe", tf_label),
+                                  (SIZE_LABELS[size_mode], position_qty if size_mode == "qty" else position_amount),
+                                  ("Target %", target_pct)) if not v]
+        if missing:
+            st.error("Fill: " + ", ".join(missing))
+        elif d_from > d_to:
+            st.error("From date must be on or before To date.")
+        elif entry_times and exit_at and exit_at <= min(entry_times.split(",")):
+            st.error("Exit time must be after the earliest Entry time.")
+        elif not items:
+            st.error("Stocks not selected.")
+        elif not picked_pats:
+            st.error("Candle patterns not selected.")
+        elif smart is None:
+            st.error("Angel One login is required (historical data login required).")
+        else:
+            interval, tf_min = TIMEFRAMES[tf_label]
+            data = {"exchange": exchange, "items": items, "capital": float(capital), "interval": interval, "tf_min": tf_min,
+                    "max_open": int(max_open), "no_limit": no_limit, "position_amount": float(position_amount or 0),
+                    "size_mode": size_mode, "position_qty": int(position_qty or 0), "target_pct": float(target_pct),
+                    "sl_pct": float(sl_pct or 0), "max_hold": int(max_hold), "patterns": list(picked_pats),
+                    "cloud_filter": cloud_pick, "cloud_exit": cloud_exit_pick,
+                    "entry_times": entry_times, "exit_at": exit_at}
+            cfg = _cfg_from_data(data)
+            cfg.slippage_pct, cfg.brokerage_pct = 0.0, 0.0          # costs removed from the UI
+            bar = st.progress(0.0, text="Loading history...")
+
+            def _prog(n, total, sym):
+                bar.progress(n / total, text=f"Loading history {n}/{total}  ({sym})")
+
+            res = run_backtest(smart, cfg, items, exchange, d_from, d_to, precise, _prog)
+            bar.empty()
+            res["capital"] = float(capital)
+            res["index_map"] = index_map
+            res["setup"] = setup                                     # the exact inputs of this run (saved with the result)
+            res["label"] = (f"{exchange} | {tf_label} | {d_from:%d %b %Y} → {d_to:%d %b %Y} | "
+                            f"{len(items)} stocks | target {target_pct}%"
+                            + (f" | entry at {entry_times.replace(',', ', ')}" if entry_times else "")
+                            + (f" | exit {exit_at}" if exit_at else "")
+                            + (f" | cloud exit {cloud_exit_pick.replace(',', '/')}" if cloud_exit_pick else ""))
+            ss["bt_result"] = res
+            # AUTO SAVE: the finished run goes to Strategies (folder / file chosen at the top)
+            if not _safe_name(file_name):
+                st.info("Result not saved to Strategies - enter a File name at the top and run again to save it.")
+            else:
+                target = (_safe_name(new_folder) or DEFAULT_FOLDER) if creating else folder_pick
+                try:
+                    replaced = save_strategy(target, file_name, setup, res)
+                    ss["sf_sel"] = target
+                    ss["bt_restore"] = {**R, "_folder": target, "_file": _safe_name(file_name)}   # next run saves to the same file
+                    st.success(f"{'Replaced' if replaced else 'Saved'} {_safe_name(file_name)} in Strategies / {target}.")
+                except Exception as ex:
+                    st.error(f"Backtest finished, but saving to Strategies failed: {ex}")
+
+    res = ss.get("bt_result")
+    if res:
+        st.subheader("Result")
+        st.caption(res["label"])
+        _bt_show(res, res["capital"])
+
+
+# ============================== STRATEGIES PAGE (folders on the side, files with Results) ==============================
+def _results_cell(m):
+    """(coloured headline, small line) of one saved file."""
+    if not m.get("has_result"):
+        return None, "No result saved"
+    s = m.get("summary") or {}
+    if not s.get("n"):
+        return None, "0 trades"
+    net, ret, pf = float(s["net"]), float(s["ret"]), float(s["pf"])
+    pf_txt = "∞" if math.isinf(pf) else f"{pf:.1f}"
+    head = f":{'green' if net >= 0 else 'red'}[**{net:+,.0f} ({ret:+.2f}%)**]"
+    return head, f"{int(s['n'])} trades · win {float(s['win_rate']):.0f}% · PF {pf_txt}"
+
+
+def _saved_on(m):
+    try:
+        return datetime.strptime(str(m.get("saved_at"))[:10], "%Y-%m-%d").strftime("%d %b")
+    except ValueError:
+        return "-"
+
+
+def strategies_page():
+    ss = st.session_state
+    msg = ss.pop("sf_msg", None)
+    if msg:
+        getattr(st, msg[0])(msg[1])
+    folders = list_folders()
+    names = [n for n, _ in folders]
+    if ss.get("sf_sel") not in names:
+        ss["sf_sel"] = names[0] if names else None
+    sel = ss["sf_sel"]
+
+    left, right = st.columns([1, 2.7], gap="medium")
+    with left.container(border=True):
+        a, b = st.columns([1, 1], vertical_alignment="center")
+        a.markdown("<div style='opacity:.85'>Folders</div>", unsafe_allow_html=True)
+        with b.popover("➕ New", use_container_width=True):
+            st.text_input("Folder name", key="sf_new_name")
+            st.button("Create folder", key="sf_new_go", on_click=_cb_new_folder)
+        for n, c in folders:
+            if st.button(f"📁 {n}  ·  {c}", key=f"sf_pick_{n}", type="primary" if n == sel else "tertiary",
+                         use_container_width=True) and n != sel:
+                ss["sf_sel"] = n
+                st.rerun()
+        if not folders:
+            st.caption("No folders yet.")
+
+    with right.container(border=True):
+        if not sel:
+            st.info("Nothing saved yet. Pick a folder and file name on the Backtest tab and run a backtest, or create a folder with New.")
+            return
+        files = list_files(sel)
+        h1, h2, h3 = st.columns([2.6, 1.5, 1.5], vertical_alignment="center")
+        h1.markdown(f"<div style='font-size:1.25rem;font-weight:700'>{html.escape(sel)}</div>"
+                    f"<div style='opacity:.65'>{len(files)} file{'s' if len(files) != 1 else ''}</div>", unsafe_allow_html=True)
+        with h2.popover("✏️ Rename folder", use_container_width=True):
+            st.text_input("New name", value=sel, key=f"sf_ren_{sel}")
+            st.button("Rename", key=f"sf_ren_go_{sel}", on_click=_cb_rename_folder, args=(sel,))
+        with h3.popover(":red[🗑 Delete folder]", use_container_width=True):
+            st.warning(f"Delete **{sel}** and its {len(files)} file{'s' if len(files) != 1 else ''}? This cannot be undone.")
+            st.button("Yes, delete folder", key=f"sf_del_go_{sel}", type="primary", on_click=_cb_delete_folder, args=(sel,))
+
+        W = [2.6, 3.1, 1.1, 2.0]
+        with st.container(border=True):
+            hc = st.columns(W)
+            for col, t in zip(hc, ("File name", "Results", "Saved", "Actions")):
+                col.markdown(f"<div style='opacity:.8;{'text-align:right' if t == 'Actions' else ''}'>{t}</div>", unsafe_allow_html=True)
+            if not files:
+                st.caption("This folder is empty.")
+            for m in files:
+                st.divider()
+                c1, c2, c3, c4 = st.columns(W, vertical_alignment="center")
+                c1.markdown(f"📄 **{m['name']}**")
+                head, sub = _results_cell(m)
+                if head:
+                    c2.markdown(head)
+                c2.caption(sub)
+                c3.markdown(_saved_on(m))
+                with c4:
+                    b1, b2, b3 = st.columns(3)
+                    key = f"{sel}_{m['file']}"
+                    b1.button("📂", key=f"sf_open_{key}", help="Open - setup and saved result on the Backtest tab",
+                              on_click=_cb_open_strategy, args=(sel, m["file"], True), use_container_width=True)
+                    b2.button("✏️", key=f"sf_edit_{key}", help="Edit - load the setup, change it, run again and save over it",
+                              on_click=_cb_open_strategy, args=(sel, m["file"], False), use_container_width=True)
+                    with b3.popover(":red[🗑]", help="Delete this file", use_container_width=True):
+                        st.write(f"Delete **{m['name']}**?")
+                        st.button("Yes, delete", key=f"sf_del_{key}", type="primary", on_click=_cb_delete_strategy, args=(sel, m["file"]))
 
 
 # ============================== ENTRY ==============================
 st.set_page_config(page_title="Backtest", layout="wide", initial_sidebar_state="collapsed")
 _ss = st.session_state
 if "smart" not in _ss and not _ss.get("no_autologin"):
-    _creds = env_creds()                                  # optional: ANGEL_* env / secrets -> auto login
+    _creds = env_creds()                                      # ANGEL_* env / secrets -> auto login (saved logins use the login page)
     if _creds:
         with st.spinner("Angel One login..."):
             _sm, _err = angel_login(*_creds)
@@ -1534,4 +2259,10 @@ else:
         _sm, _err = angel_login(*_ss.creds)
         if _sm is not None:
             _ss.smart, _ss.login_time = _sm, time.time()
-    backtest_page()
+    no_dim()
+    _ui_css()
+    _app_header()
+    if _ss.get("bt_view") == "strategies":
+        strategies_page()
+    else:
+        backtest_page()
