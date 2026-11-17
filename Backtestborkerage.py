@@ -27,7 +27,7 @@ CANDLE_KEYS = ("prev_O", "prev_H", "prev_L", "prev_C", "sig_O", "sig_H", "sig_L"
 STORE_KEYS = CANDLE_KEYS + ("hist",)          # hist = last 5 candles [O,H,L,C] (oldest -> newest) saved with every entry
 
 
-# ============================== 10 CANDLE PATTERNS (same as the Google Sheet formulas) ==============================
+# ============================== 10 CANDLE PATTERNS (candles.py rules - "Candlestick_Patterns_Logic_Comparison.docx") ==============================
 # Sheet columns: B=Open, C=High, D=Low, E=Close.  Each function gets the pattern's candles OLDEST -> NEWEST
 # (k[0] = first / "row 2" candle ... k[-1] = latest closed candle) and returns True/False (Series for a whole DataFrame).
 def _body(k):
@@ -38,103 +38,112 @@ def _rng(k):
     return k.h - k.l
 
 
-# Word-file rule for Three White Soldiers (ENTRY RULE section)
-SOLDIER_GAP_MIN = 0.995     # open >= prev_open * 0.995   (gap-down open reject)
-SOLDIER_WICK_MAX = 0.30     # upper wick <= 30% of day range (near-high close)
-SOLDIER_BODY_MIN = 0.20     # body >= 20% of day range       (strong body, doji reject)
+def _upsh(k):           # upper shadow
+    return k.h - np.maximum(k.o, k.c)
+
+
+def _losh(k):           # lower shadow
+    return np.minimum(k.o, k.c) - k.l
+
+
+# candles.py thresholds
 TWEEZER_LOW_TOL = 0.001     # two lows count as "the same" when within 0.1%
-DOWNTREND_LOOKBACK = 5      # "in a downtrend": close before the pattern < close this many candles earlier
-DOWNTREND_PATTERNS = ("Bullish Engulfing", "Hammer")      # the Word file asks for a downtrend only for these two
+DOWNTREND_LOOKBACK = 5      # "in a downtrend": close of the checked candle < close this many candles earlier
+# downtrend(i) of candles.py: which candle's close is checked, counted back from the LAST candle of the pattern (0 = last candle)
+#   Bullish Engulfing -> downtrend(i-1) = its 1st candle | Hammer -> downtrend(i) = the hammer itself | Inverted Hammer -> downtrend(i) = its 1st candle
+DOWNTREND_AT = {"Bullish Engulfing": 1, "Hammer": 0, "Inverted Hammer": 1}
+DOWNTREND_PATTERNS = tuple(DOWNTREND_AT)
 
 
-def _p_engulf(k):       # small bearish candle completely engulfed by a large bullish candle (downtrend filter applied in detect_patterns)
+def _p_engulf(k):       # bearish candle whose body is fully covered by the next bullish candle (downtrend filter applied in detect_patterns)
     a, b = k
-    return (a.o > a.c) & (b.o < b.c) & (b.o <= a.c) & (b.c >= a.o) & (_body(b) > _body(a))
+    return (a.o > a.c) & (b.o < b.c) & (b.o <= a.c) & (b.c >= a.o)
 
 
-def _p_harami(k):       # small bullish candle completely inside the body of the preceding large bearish candle
+def _p_harami(k):       # big bearish candle (body >= 50% of its range), bullish body completely inside it
     a, b = k
-    return (a.o > a.c) & (b.o < b.c) & (b.o > a.c) & (b.c < a.o)
+    return (a.o > a.c) & (b.o < b.c) & (_rng(a) > 0) & (_body(a) >= 0.50 * _rng(a)) & (b.o > a.c) & (b.c < a.o)
 
 
-def _p_marubozu(k):     # bullish, closes near its high, little/no shadow on either end
+def _p_marubozu(k):     # bullish, body >= 90% of range, both shadows <= 5% of range
     (a,) = k
-    return (a.c > a.o) & ((a.o - a.l) <= 0.05 * (a.c - a.o)) & ((a.h - a.c) <= 0.05 * (a.c - a.o))
+    r = _rng(a)
+    return (a.c > a.o) & (r > 0) & (_body(a) >= 0.90 * r) & (_upsh(a) <= 0.05 * r) & (_losh(a) <= 0.05 * r)
 
 
-def _p_hammer(k):       # small body at the top of the range, lower shadow >= 2x body (downtrend filter applied in detect_patterns)
+def _p_hammer(k):       # body <= 35% of range, lower shadow >= 2x body, upper shadow <= 15% of range (downtrend filter applied in detect_patterns)
     (a,) = k
-    bd = _body(a)
-    return ((a.h - a.l) > 0) & ((np.minimum(a.o, a.c) - a.l) >= 2 * bd) & ((a.h - np.maximum(a.o, a.c)) <= 0.1 * bd)
+    r = _rng(a)
+    return (r > 0) & (_body(a) <= 0.35 * r) & (_losh(a) >= 2 * _body(a)) & (_upsh(a) <= 0.15 * r)
 
 
-def _p_inv_hammer(k):   # small body at the bottom of the range, long upper shadow  +  NEXT candle closes bullish (confirmation)
+def _p_inv_hammer(k):   # 1st: body <= 35% of range, upper shadow >= 2x body, lower shadow <= 15% of range (+ downtrend) / 2nd: bullish and closes above the 1st close
     a, b = k
-    bd = _body(a)
-    return (((a.h - a.l) > 0) & ((a.h - np.maximum(a.o, a.c)) >= 2 * bd) & ((np.minimum(a.o, a.c) - a.l) <= 0.1 * bd)
-            & (b.c > b.o))
+    r = _rng(a)
+    return (r > 0) & (_body(a) <= 0.35 * r) & (_upsh(a) >= 2 * _body(a)) & (_losh(a) <= 0.15 * r) & (b.c > b.o) & (b.c > a.c)
 
 
-def _p_morning(k):      # bearish, small GAP-DOWN middle candle, strong bullish 3rd candle closing past the middle of the 1st body
+def _p_morning(k):      # 1st bearish, body >= 50% of range / 2nd body <= 35% of range with its HIGH below the 1st close / 3rd bullish, closes above the 1st body midpoint
     a, b, c = k
-    return ((a.c < a.o) & (_body(b) <= 0.5 * _body(a)) & (np.maximum(b.o, b.c) < a.c)
-            & (c.c > c.o) & (_body(c) >= 0.5 * _rng(c)) & (c.c >= a.o - 0.5 * (a.o - a.c)))
+    return ((a.c < a.o) & (_rng(a) > 0) & (_body(a) >= 0.50 * _rng(a))
+            & (_rng(b) > 0) & (_body(b) <= 0.35 * _rng(b)) & (b.h < a.c)
+            & (c.c > c.o) & (c.c > (a.o + a.c) / 2))
 
 
-def _p_piercing(k):     # bullish candle opens below the previous low, closes above the middle of the prior bearish body
+def _p_piercing(k):     # bullish candle opens below the previous low, closes above the middle of the prior bearish body (same in both files)
     a, b = k
     return (a.c < a.o) & (b.c > b.o) & (b.o < a.l) & (b.c > a.o - (a.o - a.c) / 2) & (b.c < a.o)
 
 
-def _p_rising3(k):      # long bullish, 3 small BEARISH candles inside its range, 5th bullish candle closes above the 1st candle's HIGH
+def _p_rising3(k):      # 1st bullish (body >= 40% of range), 3 bearish candles with smaller bodies INSIDE its high-low range, 5th bullish closes above the 1st HIGH
     a, b, c, d, e = k
-    ok = a.c > a.o
+    ok = (a.c > a.o) & (_rng(a) > 0) & (_body(a) >= 0.40 * _rng(a))
     for m in (b, c, d):
-        ok = ok & (m.c < m.o) & (_body(m) <= 0.5 * _body(a)) & (m.h <= a.h) & (m.l >= a.l)
+        ok = ok & (m.c < m.o) & (_body(m) <= _body(a)) & (np.maximum(m.o, m.c) <= a.h) & (np.minimum(m.o, m.c) >= a.l)
     return ok & (e.c > e.o) & (e.c > a.h)
 
 
-def _p_soldiers(k):     # Word ENTRY RULE: bullish, rising closes, no gap-down open, near-high close, strong body (every candle)
+def _p_soldiers(k):     # 3 bullish candles, rising closes, EXACT open check (no gap-down), upper wick <= 30% of range, body >= 20% of range
     a, b, c = k
-    ok = (b.c > a.c) & (c.c > b.c) & (b.o >= a.o * SOLDIER_GAP_MIN) & (c.o >= b.o * SOLDIER_GAP_MIN)
+    ok = (b.c > a.c) & (c.c > b.c) & (b.o >= a.o) & (c.o >= b.o)
     for m in (a, b, c):
         r = _rng(m)
-        ok = ok & (m.c > m.o) & (r > 0) & ((m.h - m.c) <= SOLDIER_WICK_MAX * r) & (_body(m) >= SOLDIER_BODY_MIN * r)
+        ok = ok & (m.c > m.o) & (r > 0) & (_upsh(m) <= 0.30 * r) & (_body(m) >= 0.20 * r)
     return ok
 
 
-def _p_tweezer(k):      # two candles share the same low, followed by a bullish confirmation candle
+def _p_tweezer(k):      # two candles share the same low (0.1%), 3rd candle bullish AND closes above the 2nd candle's HIGH
     a, b, c = k
-    return ((b.l - a.l).abs() <= TWEEZER_LOW_TOL * a.l) & (c.c > c.o)
+    return ((b.l - a.l).abs() <= TWEEZER_LOW_TOL * a.l) & (c.c > c.o) & (c.c > b.h)
 
 
 # (name, candles used, python check, Excel/Sheets formula builder: rows -> formula)   Excel columns: B=Open C=High D=Low E=Close
-# (the downtrend condition for Engulfing / Hammer is applied in Python only - see DOWNTREND_PATTERNS)
+# (the downtrend condition for Engulfing / Hammer / Inverted Hammer is applied in Python only - see DOWNTREND_AT)
 PATTERN_DEFS = (
     ("Bullish Engulfing", 2, _p_engulf,
-     lambda r: f'=IF(AND(B{r[0]}>E{r[0]},B{r[1]}<E{r[1]},B{r[1]}<=E{r[0]},E{r[1]}>=B{r[0]},ABS(E{r[1]}-B{r[1]})>ABS(E{r[0]}-B{r[0]})),"BULLISH ENGULFING ","")'),
+     lambda r: f'=IF(AND(B{r[0]}>E{r[0]},B{r[1]}<E{r[1]},B{r[1]}<=E{r[0]},E{r[1]}>=B{r[0]}),"BULLISH ENGULFING ","")'),
     ("Bullish Harami", 2, _p_harami,
-     lambda r: f'=IF(AND(B{r[0]}>E{r[0]},B{r[1]}<E{r[1]},B{r[1]}>E{r[0]},E{r[1]}<B{r[0]}),"BULLISH harami","")'),
+     lambda r: f'=IF(AND(B{r[0]}>E{r[0]},B{r[1]}<E{r[1]},C{r[0]}>D{r[0]},(B{r[0]}-E{r[0]})>=0.5*(C{r[0]}-D{r[0]}),B{r[1]}>E{r[0]},E{r[1]}<B{r[0]}),"BULLISH harami","")'),
     ("Bullish Marubozu", 1, _p_marubozu,
-     lambda r: f'=IF(AND(E{r[0]}>B{r[0]},(B{r[0]}-D{r[0]})<=0.05*(E{r[0]}-B{r[0]}),(C{r[0]}-E{r[0]})<=0.05*(E{r[0]}-B{r[0]})),"Bullish Marubozu","")'),
+     lambda r: f'=IF(AND(E{r[0]}>B{r[0]},C{r[0]}>D{r[0]},(E{r[0]}-B{r[0]})>=0.9*(C{r[0]}-D{r[0]}),(C{r[0]}-E{r[0]})<=0.05*(C{r[0]}-D{r[0]}),(B{r[0]}-D{r[0]})<=0.05*(C{r[0]}-D{r[0]})),"Bullish Marubozu","")'),
     ("Hammer", 1, _p_hammer,
-     lambda r: f'=IF(AND(C{r[0]}>D{r[0]},(MIN(B{r[0]},E{r[0]})-D{r[0]})>=2*ABS(E{r[0]}-B{r[0]}),(C{r[0]}-MAX(B{r[0]},E{r[0]}))<=0.1*ABS(E{r[0]}-B{r[0]})),"HAMMER","")'),
+     lambda r: f'=IF(AND(C{r[0]}>D{r[0]},ABS(E{r[0]}-B{r[0]})<=0.35*(C{r[0]}-D{r[0]}),(MIN(B{r[0]},E{r[0]})-D{r[0]})>=2*ABS(E{r[0]}-B{r[0]}),(C{r[0]}-MAX(B{r[0]},E{r[0]}))<=0.15*(C{r[0]}-D{r[0]})),"HAMMER","")'),
     ("Inverted Hammer", 2, _p_inv_hammer,
-     lambda r: f'=IF(AND(C{r[0]}>D{r[0]},(C{r[0]}-MAX(B{r[0]},E{r[0]}))>=2*ABS(E{r[0]}-B{r[0]}),(MIN(B{r[0]},E{r[0]})-D{r[0]})<=0.1*ABS(E{r[0]}-B{r[0]}),E{r[1]}>B{r[1]}),"INVERTED HAMMER","")'),
+     lambda r: f'=IF(AND(C{r[0]}>D{r[0]},ABS(E{r[0]}-B{r[0]})<=0.35*(C{r[0]}-D{r[0]}),(C{r[0]}-MAX(B{r[0]},E{r[0]}))>=2*ABS(E{r[0]}-B{r[0]}),(MIN(B{r[0]},E{r[0]})-D{r[0]})<=0.15*(C{r[0]}-D{r[0]}),E{r[1]}>B{r[1]},E{r[1]}>E{r[0]}),"INVERTED HAMMER","")'),
     ("Morning Star", 3, _p_morning,
-     lambda r: f'=IF(AND(E{r[0]}<B{r[0]},ABS(E{r[1]}-B{r[1]})<=0.5*ABS(E{r[0]}-B{r[0]}),MAX(B{r[1]},E{r[1]})<E{r[0]},E{r[2]}>B{r[2]},ABS(E{r[2]}-B{r[2]})>=0.5*(C{r[2]}-D{r[2]}),E{r[2]}>=B{r[0]}-0.5*(B{r[0]}-E{r[0]})),"MORNING STAR","")'),
+     lambda r: f'=IF(AND(E{r[0]}<B{r[0]},C{r[0]}>D{r[0]},(B{r[0]}-E{r[0]})>=0.5*(C{r[0]}-D{r[0]}),C{r[1]}>D{r[1]},ABS(E{r[1]}-B{r[1]})<=0.35*(C{r[1]}-D{r[1]}),C{r[1]}<E{r[0]},E{r[2]}>B{r[2]},E{r[2]}>(B{r[0]}+E{r[0]})/2),"MORNING STAR","")'),
     ("Piercing", 2, _p_piercing,
      lambda r: f'=IF(AND(E{r[0]}<B{r[0]},E{r[1]}>B{r[1]},B{r[1]}<D{r[0]},E{r[1]}>B{r[0]}-(B{r[0]}-E{r[0]})/2,E{r[1]}<B{r[0]}),"PIERCING","")'),
     ("Rising Three Methods", 5, _p_rising3,
-     lambda r: (f'=IF(AND(E{r[0]}>B{r[0]},'
-                + ','.join(f'E{x}<B{x},ABS(E{x}-B{x})<=0.5*ABS(E{r[0]}-B{r[0]}),C{x}<=C{r[0]},D{x}>=D{r[0]}' for x in r[1:4])
+     lambda r: (f'=IF(AND(E{r[0]}>B{r[0]},C{r[0]}>D{r[0]},(E{r[0]}-B{r[0]})>=0.4*(C{r[0]}-D{r[0]}),'
+                + ','.join(f'E{x}<B{x},ABS(E{x}-B{x})<=ABS(E{r[0]}-B{r[0]}),MAX(B{x},E{x})<=C{r[0]},MIN(B{x},E{x})>=D{r[0]}' for x in r[1:4])
                 + f',E{r[4]}>B{r[4]},E{r[4]}>C{r[0]}),"RISING THREE METHODS","")')),
     ("Three White Soldiers", 3, _p_soldiers,
      lambda r: ('=IF(AND(' + ','.join(
-         f'E{x}>B{x},C{x}>D{x},(C{x}-E{x})<={SOLDIER_WICK_MAX}*(C{x}-D{x}),(E{x}-B{x})>={SOLDIER_BODY_MIN}*(C{x}-D{x})' for x in r)
-         + f',E{r[1]}>E{r[0]},E{r[2]}>E{r[1]},B{r[1]}>=B{r[0]}*{SOLDIER_GAP_MIN},B{r[2]}>=B{r[1]}*{SOLDIER_GAP_MIN}),"THREE WHITE SOLDIERS","")')),
+         f'E{x}>B{x},C{x}>D{x},(C{x}-E{x})<=0.3*(C{x}-D{x}),(E{x}-B{x})>=0.2*(C{x}-D{x})' for x in r)
+         + f',E{r[1]}>E{r[0]},E{r[2]}>E{r[1]},B{r[1]}>=B{r[0]},B{r[2]}>=B{r[1]}),"THREE WHITE SOLDIERS","")')),
     ("Tweezer Bottom", 3, _p_tweezer,
-     lambda r: f'=IF(AND(ABS(D{r[1]}-D{r[0]})<={TWEEZER_LOW_TOL}*D{r[0]},E{r[2]}>B{r[2]}),"TWEEZER BOTTOM","")'),
+     lambda r: f'=IF(AND(ABS(D{r[1]}-D{r[0]})<={TWEEZER_LOW_TOL}*D{r[0]},E{r[2]}>B{r[2]},E{r[2]}>C{r[1]}),"TWEEZER BOTTOM","")'),
 )
 PATTERNS = tuple(d[0] for d in PATTERN_DEFS)
 
@@ -144,6 +153,8 @@ TREND_LOOKBACK = 0
 TWEEZER_TOL_PCT = 0.10
 FUTURES_MARGIN_PCT = 10.0
 BROKERAGE_PCT = 0.0
+BROKERAGE_BUY_PCT = 0.5     # brokerage on the BUY leg  = buy value  x this %
+BROKERAGE_SELL_PCT = 0.5    # brokerage on the SELL leg = sell value x this %
 SLIPPAGE_PCT = 0.0
 FRESH_SECONDS = 120
 REFRESH_SECONDS = 5
@@ -179,6 +190,8 @@ class Config:
     tweezer_tol_pct: float = TWEEZER_TOL_PCT
     trend_lookback: int = TREND_LOOKBACK
     brokerage_pct: float = BROKERAGE_PCT
+    brokerage_buy_pct: float = BROKERAGE_BUY_PCT      # % of buy value (entry x qty) charged on the buy order
+    brokerage_sell_pct: float = BROKERAGE_SELL_PCT    # % of sell value (exit x qty) charged on the sell order
     slippage_pct: float = SLIPPAGE_PCT
     interval: str = "FIVE_MINUTE"
     tf_min: int = 5
@@ -190,6 +203,7 @@ class Config:
     no_limit: bool = False
     cloud_filter: str = ""              # optional Ichimoku cloud filter: "" (off) | "Above" | "Center" | "Below"
     cloud_exit: str = ""                # optional Ichimoku cloud EXIT: "" (off) | "Above" | "Center" | "Below" (comma separated for several)
+    cloud_exit_mode: str = "OR"         # how Target and Cloud exit combine: "OR" (first one hit exits) | "AND" (both must be satisfied)
     entry_times: str = ""               # OPTIONAL time condition: comma separated candle times "HH:MM,HH:MM" ("" = all times)
     exit_at: str = ""                   # TIME CONDITION: square-off time (HH:MM) ("" = default 15:15 NSE / 23:15 MCX)
 
@@ -232,6 +246,9 @@ def _cfg_from_data(d):
         no_limit=bool(d.get("no_limit", False)),
         cloud_filter=cloud_text(d.get("cloud_filter")),
         cloud_exit=cloud_text(d.get("cloud_exit")),
+        brokerage_buy_pct=float(d.get("brokerage_buy_pct", BROKERAGE_BUY_PCT) or 0),
+        brokerage_sell_pct=float(d.get("brokerage_sell_pct", BROKERAGE_SELL_PCT) or 0),
+        cloud_exit_mode="AND" if str(d.get("cloud_exit_mode") or "").upper() == "AND" else "OR",
         entry_times=str(d.get("entry_times") or ""),
         exit_at=str(d.get("exit_at") or ""),
         max_hold=int(d.get("max_hold", MAX_HOLD_DAYS) or MAX_HOLD_DAYS),
@@ -302,11 +319,10 @@ def detect_patterns(df, cfg=None, downtrend=True):
     lb = int(getattr(cfg, "trend_lookback", 0) or 0)
     if lb > 0:                                              # optional extra filter for ALL patterns (off by default)
         sig = sig.mul(c.shift(1) < c.shift(lb + 1), axis=0).astype(bool)
-    n_of = {name: n for name, n, _, _ in PATTERN_DEFS}
-    for name in (DOWNTREND_PATTERNS if downtrend else ()):  # Word file: only these need "in a downtrend"
+    for name in (DOWNTREND_PATTERNS if downtrend else ()):  # candles.py: Engulfing / Hammer / Inverted Hammer need "in a downtrend"
         if name in sig.columns:
-            n = n_of[name]                                  # candle just before the pattern vs DOWNTREND_LOOKBACK candles earlier
-            sig[name] = sig[name].astype(bool) & (c.shift(n) < c.shift(n + DOWNTREND_LOOKBACK)).fillna(False)
+            s = DOWNTREND_AT[name]                          # close of the checked candle < close DOWNTREND_LOOKBACK candles earlier
+            sig[name] = sig[name].astype(bool) & (c.shift(s) < c.shift(s + DOWNTREND_LOOKBACK)).fillna(False)
     return sig.fillna(False).astype(bool)
 
 
@@ -766,7 +782,7 @@ def exchange_list(df, exchange, index=None):
         d["exp"] = pd.to_datetime(d["expiry"], format="%d%b%Y", errors="coerce")
         d = d[d["exp"] >= pd.Timestamp.now().normalize()].sort_values("exp")
         d = d.drop_duplicates("name")
-        d["label"] = d["symbol"]
+        d["label"] = d["name"]                    # GOLDM / SILVERM ... - the contract is chosen per date in the backtest
     return d.drop_duplicates("label").sort_values("label")
 
 
@@ -961,6 +977,88 @@ os.makedirs(BT_CACHE_DIR, exist_ok=True)
 _BT_ORIGIN = pd.Timestamp("2015-01-01")          # fixed chunk grid -> past chunks are re-used from disk on every run
 
 
+# ---- FUTURES CONTRACT REGISTRY: the scrip master only lists LIVE contracts, so every contract ever seen is remembered
+#      on disk (token, symbol, expiry). The backtest then uses, on every date, the contract that was the front month then.
+CONTRACTS_FILE = os.path.join(_DATA_DIR, "contracts_registry.json")
+ROLL_DAYS = 3                                   # switch to the next contract this many days before the expiry day
+_REG_LOCK = threading.Lock()
+
+
+def _registry_load():
+    try:
+        with open(CONTRACTS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def registry_update(master):
+    """Add every live NFO / MCX futures contract of the scrip master to the on-disk registry."""
+    try:
+        d = master[master["exch_seg"].isin(["NFO", "MCX"])]
+        d = d[d["instrumenttype"].fillna("").astype(str).str.startswith("FUT")]
+        with _REG_LOCK:
+            reg, changed = _registry_load(), False
+            cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=1100)
+            for r in d.to_dict("records"):
+                exp = pd.to_datetime(r.get("expiry"), format="%d%b%Y", errors="coerce")
+                if pd.isna(exp) or exp < cutoff:
+                    continue
+                try:
+                    lot = max(int(float(r.get("lotsize") or 1)), 1)
+                except (TypeError, ValueError):
+                    lot = 1
+                grp = reg.setdefault(f"{r['exch_seg']}|{str(r['name']).upper()}", {})
+                tok = str(r["token"])
+                if tok not in grp:
+                    grp[tok] = {"token": tok, "symbol": r["symbol"], "expiry": exp.strftime("%Y-%m-%d"), "lot": lot}
+                    changed = True
+            if changed:
+                _write_json(CONTRACTS_FILE, reg)
+    except Exception:
+        pass
+
+
+@st.cache_resource(ttl=86400, show_spinner=False)
+def _registry_sync():
+    registry_update(load_master())
+    return True
+
+
+def _contracts(item):
+    """Known futures contracts of this name, earliest expiry first."""
+    key = f"{item['exchange']}|{str(item.get('name') or item['symbol']).upper()}"
+    rows = list(_registry_load().get(key, {}).values())
+    if not any(str(r["token"]) == str(item["token"]) for r in rows):      # registry not synced yet -> at least the selected contract
+        rows.append({"token": str(item["token"]), "symbol": item["tradingsymbol"], "expiry": "2100-01-01"})
+    return sorted(rows, key=lambda r: r["expiry"])
+
+
+def _bt_load_cont(smart, item, interval, start, end):
+    """Candles for one stock. NFO / MCX futures: the contract that was the FRONT month on each date is stitched into one series
+       (new column 'seg' = which contract; it changes at every roll). Equities: same as _bt_load (seg = 0)."""
+    if item["exchange"] not in ("NFO", "MCX"):
+        d = _bt_load(smart, item, interval, start, end)
+        if not d.empty:
+            d["seg"] = 0
+        return d
+    parts, lo = [], pd.Timestamp(start)
+    for n, c in enumerate(_contracts(item)):
+        hi = pd.Timestamp(c["expiry"]) - pd.Timedelta(days=ROLL_DAYS)            # this contract is used until here (exclusive)
+        a, b = max(lo, pd.Timestamp(start)), min(hi, pd.Timestamp(end))
+        lo = max(lo, hi)
+        if a >= b:
+            continue
+        d = _bt_load(smart, {**item, "token": c["token"], "tradingsymbol": c["symbol"]}, interval, a, b)
+        if d is not None and not d.empty:
+            parts.append(d.assign(seg=n))
+        if b >= pd.Timestamp(end):
+            break
+    if not parts:
+        return pd.DataFrame()
+    return pd.concat(parts).drop_duplicates("date").sort_values("date").reset_index(drop=True)
+
+
 def _bt_load(smart, item, interval, start, end):
     """Candles from start to end for one stock (date, open, high, low, close), fetched in API-sized chunks.
        Chunks that lie completely in the past are cached on disk, so changing target % / patterns is instant."""
@@ -1005,24 +1103,38 @@ def _bt_deadline(etime, ex, max_hold, xt=None):
     return pd.Timestamp(day) + pd.Timedelta(hours=xt.hour, minutes=xt.minute)
 
 
-def _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl, cx=None):
+def _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl, cx=None, S=None, mode="OR"):
     """Walk forward from bar i0. SL is checked before target inside a bar (same as _check_exit).
-       cx (optional) = per-bar cloud-exit position ('' = no signal): when a bar CLOSES in a chosen cloud position and neither
-       SL nor target was hit inside it, the trade exits at that bar's close.
+       cx (optional) = per-bar cloud-exit position ('' = no signal).
+       mode "OR"  : the FIRST of target / cloud exit exits the trade (target at its price, cloud at that bar's close).
+       mode "AND" : BOTH must be satisfied. The target counts as satisfied once price has touched it (stays satisfied);
+                    the trade then exits at the close of the first bar that closes in a chosen cloud position
+                    (that same bar counts). SL and the time exit always stay active.
        Returns (price, time, reason) or None when there is no bar to walk."""
     n, k, last = len(T), i0, None
+    both = (mode == "AND" and cx is not None)
+    tgt_hit = False
+    s0 = S[i0] if (S is not None and i0 < n) else None
     while k < n and T[k] < deadline:
+        if S is not None and S[k] != s0 and last is not None:       # the contract rolled -> prices are no longer comparable
+            return float(C[last]), T[last], "Contract roll"
         if sl:
             if O[k] <= sl:
                 return float(O[k]), T[k], "SL (gap)"
             if L[k] <= sl:
                 return float(sl), T[k], "SL"
-        if O[k] >= tgt:
-            return float(O[k]), T[k], "Target (gap)"
-        if H[k] >= tgt:
-            return float(tgt), T[k], "Target"
-        if cx is not None and cx[k]:
-            return float(C[k]), T[k], f"Cloud exit ({cx[k]})"
+        if both:
+            if not tgt_hit and H[k] >= tgt:                         # target touched -> satisfied from now on
+                tgt_hit = True
+            if tgt_hit and cx[k]:                                   # ... and a bar closes in the chosen cloud position
+                return float(C[k]), T[k], f"Target + Cloud ({cx[k]})"
+        else:
+            if O[k] >= tgt:
+                return float(O[k]), T[k], "Target (gap)"
+            if H[k] >= tgt:
+                return float(tgt), T[k], "Target"
+            if cx is not None and cx[k]:
+                return float(C[k]), T[k], f"Cloud exit ({cx[k]})"
         last = k
         k += 1
     if last is None:
@@ -1047,6 +1159,7 @@ def _bt_candidates(it, df, cfg, start, end, order):
                     np.where(close < cl["bottom"], "Below", "Center")))
     T = df["date"].tolist()
     O = df["open"].astype(float).to_numpy()
+    seg = df["seg"].to_numpy() if "seg" in df.columns else None
     open_off = pd.Timedelta(hours=9) if ex == "MCX" else pd.Timedelta(hours=9, minutes=15)
     xt_eff = eff_exit(cfg, ex)                              # chosen exit time (default square-off)
     cands, skipped = [], []
@@ -1069,6 +1182,9 @@ def _bt_candidates(it, df, cfg, start, end, order):
         if i + 1 >= len(df):
             continue                                        # no next candle in the data yet
         j = i + 1
+        if seg is not None and seg[max(i - 4, 0)] != seg[j]:
+            skipped.append({**rec, "status": "SKIPPED (pattern candles span a contract roll)"})
+            continue
         if intraday and (T[j].date() != ts.date() or T[j] - cend > tf):
             skipped.append({**rec, "status": "SKIPPED (data gap after signal candle)"})
             continue
@@ -1110,13 +1226,17 @@ def _bt_portfolio(cands, cfg, exits_for):
             continue
         raw_px, xt, reason, release = hit
         exit_px = raw_px * (1 - cfg.slippage_pct / 100)
-        pnl = (exit_px - entry) * qty - cfg.brokerage_pct / 100 * (entry + exit_px) * qty
+        buy_value, sell_value = entry * qty, exit_px * qty
+        brk_buy = buy_value * cfg.brokerage_buy_pct / 100          # buy leg  : buy value  x buy %
+        brk_sell = sell_value * cfg.brokerage_sell_pct / 100       # sell leg : sell value x sell %
+        pnl = (sell_value - buy_value) - brk_buy - brk_sell         # net P&L after both legs
         open_.append({
             "symbol": c["symbol"], "exchange": ex, "pattern": c["pattern"], "cloud": c["cloud"],
             "signal_candle": c["candle"], "entry_time": c["etime"], "entry": round(entry, 2),
             "target": tgt, "stop_loss": sl, "qty": int(qty), "invested": round(entry * qty * mf, 2),
             "exit_time": xt, "exit": round(exit_px, 2), "reason": reason,
-            "pnl": round(pnl, 2), "pnl_pct": round((exit_px / entry - 1) * 100, 2),
+            "brokerage_buy": round(brk_buy, 2), "brokerage_sell": round(brk_sell, 2),
+            "pnl": round(pnl, 2), "pnl_pct": round(pnl / buy_value * 100, 2),
             "_xt": release, "_mf": mf,
         })
         skipped.append({**rec, "status": "ENTERED"})
@@ -1134,8 +1254,8 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
     errors, cands, sigs, bars, cxs = [], [], [], {}, {}
 
     def load(it):
-        df = _bt_load(smart, it, cfg.interval, start - warm, load_to)
-        b1 = _bt_load(smart, it, "ONE_MINUTE", start, load_to) if precise and not df.empty else None
+        df = _bt_load_cont(smart, it, cfg.interval, start - warm, load_to)
+        b1 = _bt_load_cont(smart, it, "ONE_MINUTE", start, load_to) if precise and not df.empty else None
         return it, df, b1
 
     done = 0
@@ -1160,7 +1280,8 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
             src = b1 if (b1 is not None and not b1.empty) else df
             bars[(it["exchange"], it["symbol"])] = (
                 src["date"].tolist(), src["open"].astype(float).to_numpy(), src["high"].astype(float).to_numpy(),
-                src["low"].astype(float).to_numpy(), src["close"].astype(float).to_numpy(), src is df)
+                src["low"].astype(float).to_numpy(), src["close"].astype(float).to_numpy(), src is df,
+                src["seg"].to_numpy() if "seg" in src.columns else None)
             if cloud_list(cfg.cloud_exit):                  # cloud EXIT: mark every walk bar that closes a matching cloud candle
                 cmap = cloud_exit_events(df, cfg, it["exchange"])
                 bl = pd.Timedelta(minutes=cfg.tf_min) if src is df else pd.Timedelta(minutes=1)
@@ -1169,10 +1290,10 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
                 errors.append(f"{it['symbol']}: no 1-minute data, used {cfg.interval} candles for exits")
 
     def exits_for(c, tgt, sl):
-        T, O, H, L, C, same_tf = bars[(c["exchange"], c["symbol"])]
+        T, O, H, L, C, same_tf, S = bars[(c["exchange"], c["symbol"])]
         i0 = c["j"] if same_tf else bisect.bisect_left(T, c["etime"])
         deadline = _bt_deadline(c["etime"], c["exchange"], cfg.max_hold, eff_exit(cfg, c["exchange"]))
-        hit = _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl, cxs.get((c["exchange"], c["symbol"])))
+        hit = _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl, cxs.get((c["exchange"], c["symbol"])), S, cfg.cloud_exit_mode)
         if hit is None:
             return None
         px, xt, reason = hit
@@ -1330,6 +1451,138 @@ def _bt_by_index(trades, imap, capital, tf_min):
     _csv_button(f"⬇ {pick} trades CSV", one, f"backtest_trades_{pick.replace(' ', '_')}", "bt_dl_index_trades")
 
 
+# ============================== INDEX COMPARISON (benchmark = the index's own candles from Angel One) ==============================
+POPULAR_INDICES = ("Nifty 50", "Nifty Bank", "SENSEX", "Nifty IT", "Nifty Next 50", "Nifty Midcap 100",
+                   "Nifty Financial Services", "Nifty Auto", "Nifty Pharma", "Nifty FMCG", "Nifty Metal")
+_INDEX_ALIAS = {"sensex30": "sensex", "niftyfinancialservices": "niftyfinservice"}     # setup name -> Angel One name (normalised)
+
+
+def _norm_name(s):
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def angel_indices():
+    """Index instruments of the Angel One scrip master (NSE / BSE) -> [{label, exchange, token, symbol, tradingsymbol}], popular first."""
+    try:
+        d = load_master()
+    except Exception:
+        return []
+    d = d[d["exch_seg"].isin(["NSE", "BSE"])]
+    it = d["instrumenttype"].fillna("").astype(str).str.upper() if "instrumenttype" in d else pd.Series("", index=d.index)
+    d = d[it.str.contains("IDX") & ~it.str.startswith(("FUT", "OPT"))]
+    rows, seen = [], set()
+    for r in d.to_dict("records"):
+        sym, nm = str(r.get("symbol") or "").strip(), str(r.get("name") or "").strip()
+        base = sym or nm                                       # symbol is the readable one ("Nifty 50"), name is a code ("NIFTY")
+        if not base:
+            continue
+        label = base if base not in seen else f"{base} ({r['exch_seg']})"
+        if label in seen:
+            continue
+        seen.add(label)
+        rows.append({"label": label, "exchange": r["exch_seg"], "token": str(r["token"]),
+                     "symbol": base, "tradingsymbol": sym or base, "keys": {_norm_name(sym), _norm_name(nm)} - {""}})
+    pop = {_norm_name(x): n for n, x in enumerate(POPULAR_INDICES)}
+    rows.sort(key=lambda r: (min([pop[k] for k in r["keys"] if k in pop] or [999]), r["label"].lower()))
+    return rows
+
+
+def _bt_index_candles(smart, ix, d_from, d_to):
+    """Daily candles of one index for From..To (session cache; _bt_load also caches finished chunks on disk)."""
+    cache = st.session_state.setdefault("bt_idx_cache", {})
+    key = (ix["exchange"], ix["token"], str(d_from), str(d_to))
+    if key not in cache:
+        start = pd.Timestamp(d_from)
+        end = min(pd.Timestamp(d_to) + pd.Timedelta(days=1), now_ist() + pd.Timedelta(days=1))
+        try:
+            d = _bt_load(smart, ix, "ONE_DAY", start, end)
+        except Exception:
+            d = pd.DataFrame()
+        if d is None or d.empty:
+            return pd.DataFrame()                                  # not cached -> tried again next time
+        cache[key] = d
+    return cache[key]
+
+
+def _bt_index_stats(d):
+    """Buy & hold of the index: first day OPEN -> last day CLOSE, plus its max drawdown and a daily % curve."""
+    d = d.sort_values("date")
+    close = d["close"].astype(float)
+    first_open, last_close = float(d["open"].iloc[0]), float(close.iloc[-1])
+    px = pd.concat([pd.Series([first_open]), close], ignore_index=True)
+    dd = float(((px.cummax() - px) / px.cummax()).max() * 100)
+    curve = pd.Series((close.to_numpy() / first_open - 1) * 100, index=pd.to_datetime(d["date"]).dt.normalize().to_numpy())
+    curve = curve[~curve.index.duplicated(keep="last")]
+    return {"ret": (last_close / first_open - 1) * 100, "dd_pct": dd, "first": first_open, "last": last_close, "curve": curve}
+
+
+def _bt_strategy_curve(trades, capital):
+    """Cumulative backtest P&L as % of capital, one point per exit day."""
+    x = pd.to_datetime(trades["exit_time"], errors="coerce")
+    if getattr(x.dt, "tz", None) is not None:
+        x = x.dt.tz_localize(None)
+    return trades["pnl"].astype(float).groupby(x.dt.normalize()).sum().cumsum() / capital * 100
+
+
+def _bt_index_compare(res, trades, capital):
+    """'Compare with an index' box on top of the result: index chosen from Angel One's index list vs this backtest."""
+    ss = st.session_state
+    setup = res.get("setup") or {}
+    opts = angel_indices()
+    with st.expander("📊 Compare with an index (Angel One)", expanded=True):
+        if not opts:
+            st.info("Index list could not be loaded from the Angel One scrip master.")
+            return
+        by_label = {o["label"]: o for o in opts}
+        if "bt_cmp_idx" not in ss:                          # first time: the index chosen in the setup (if Angel One has it)
+            want = {_INDEX_ALIAS.get(_norm_name(x), _norm_name(x)) for x in (setup.get("index_pick") or [])}
+            ss["bt_cmp_idx"] = [o["label"] for o in opts if o["keys"] & want][:3]
+        else:
+            ss["bt_cmp_idx"] = [x for x in ss["bt_cmp_idx"] if x in by_label]
+        pick = st.multiselect("Index to compare with", list(by_label), key="bt_cmp_idx",
+                              help="Index list comes from Angel One. Its own candles for the same From - To dates are loaded and "
+                                   "compared with this backtest.")
+        if not pick:
+            st.caption("Select an index (Nifty 50, Nifty Bank, SENSEX ...) to compare its result with this backtest.")
+            return
+        smart = ss.get("smart")
+        if smart is None:
+            st.warning("Angel One login is required to load index candles.")
+            return
+        t0, t1 = pd.to_datetime(trades["entry_time"]).min().date(), pd.to_datetime(trades["exit_time"]).max().date()
+        d_from, d_to = _date_or(setup.get("d_from"), t0), _date_or(setup.get("d_to"), t1)
+        stats, miss = {}, []
+        with st.spinner("Loading index candles..."):
+            for lb in pick:
+                d = _bt_index_candles(smart, by_label[lb], d_from, d_to)
+                if not d.empty:
+                    d = d[(d["date"] >= pd.Timestamp(d_from)) & (d["date"] < pd.Timestamp(d_to) + pd.Timedelta(days=1))]
+                if d.empty:
+                    miss.append(lb)
+                else:
+                    stats[lb] = _bt_index_stats(d)
+        if miss:
+            st.warning("No candle data for: " + ", ".join(miss))
+        if not stats:
+            return
+        s = bt_stats(trades, capital)
+        rows = [{"": "My backtest", "Return": f"{s['ret']:+.2f}%", "Max drawdown": f"-{s['dd_pct']:.2f}%",
+                 "From → To": f"{capital:,.0f} → {capital + s['net']:,.0f}", "My backtest vs index": ""}]
+        for lb, x in stats.items():
+            diff = s["ret"] - x["ret"]
+            rows.append({"": lb, "Return": f"{x['ret']:+.2f}%", "Max drawdown": f"-{x['dd_pct']:.2f}%",
+                         "From → To": f"{x['first']:,.2f} → {x['last']:,.2f}",
+                         "My backtest vs index": f"{diff:+.2f} pts ({'ahead' if diff >= 0 else 'behind'})"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        curves = {"My backtest (% of capital)": _bt_strategy_curve(trades, capital)}
+        curves.update({f"{lb} (%)": x["curve"] for lb, x in stats.items()})
+        st.line_chart(pd.concat(curves, axis=1, sort=True).sort_index().ffill().fillna(0.0))
+        st.caption(f"Index = buy & hold from the first day's open to the last day's close of {d_from:%d %b %Y} → {d_to:%d %b %Y} "
+                   "(daily candles from Angel One). Backtest return = net P&L ÷ total capital - the capital is not fully "
+                   "invested all the time, so this is a rough benchmark, not a like-for-like return.")
+
+
 ALL_INDICES = "All indices (combined)"
 
 
@@ -1361,6 +1614,7 @@ def _bt_show(res, capital):
         if signals is not None and not signals.empty:
             st.dataframe(signals, use_container_width=True, hide_index=True)
         return
+    _bt_index_compare(res, trades, capital)                  # index (from Angel One) vs this backtest, on top of the result
     s = bt_stats(trades, capital)
     r1 = st.columns(4)
     r1[0].metric("Net P&L", f"{s['net']:,.0f}", f"{s['ret']:.2f}% of capital")
@@ -1574,6 +1828,7 @@ def _cb_open_strategy(folder, stem, with_result):
     ss["bt_restore"] = {**(meta.get("setup") or {}), "_folder": folder, "_file": meta.get("name", stem)}
     ss["bt_gen"] = ss.get("bt_gen", 0) + 1                    # new widget keys -> the form starts from the saved values
     ss.pop("bt_index_filter", None)
+    ss.pop("bt_cmp_idx", None)
     if with_result and res is not None:
         ss["bt_result"] = res
     else:
@@ -1863,7 +2118,7 @@ def exchange_universe(exchange):
         d = d[itype.str.startswith("FUT")].copy()
         d["exp"] = pd.to_datetime(d["expiry"], format="%d%b%Y", errors="coerce")
         d = d[d["exp"] >= pd.Timestamp.now().normalize()].sort_values("exp").drop_duplicates("name")
-        d["label"] = d["symbol"]
+        d["label"] = d["name"]
     return d.drop_duplicates("label").reset_index(drop=True)
 
 
@@ -1911,6 +2166,8 @@ def backtest_page():
         master = None
         st.warning(f"Stock list load aagala ({ex}).")
 
+    if master is not None:
+        _registry_sync()
     save_box = st.container(border=True)                      # SAVE TO FOLDER sits at the very top; filled in below
     today = now_ist().date()
     EXCH = ["NSE", "BSE", "NFO", "MCX"]
@@ -2049,15 +2306,36 @@ def backtest_page():
             max_hold = x3.number_input("Max hold (days)", min_value=1, value=int(R.get("max_hold") or MAX_HOLD_DAYS), step=1,
                                        key=K("bt_hold"),
                                        help="1 = same-day square-off at 15:15 (NSE) / 23:15 (MCX) - or the Exit time chosen in Time condition.")
-            cx1, _cx2, _cx3 = st.columns(3)
+            cx1, cx2, _cx3 = st.columns(3)
             with cx1:
                 cloud_exit_sel = _stock_picker("Ichimoku cloud exit (optional)", [CLOUD_LABEL[k] for k in CLOUD_OPTIONS],
                                                K("bt_cloud_exit"), default=R.get("cloud_exit_sel"),
                                                button_label="Select cloud exit position (optional)")
             cloud_exit_pick = cloud_text([CLOUD_BY_LABEL[x] for x in cloud_exit_sel])
-            if cloud_exit_pick:
-                st.caption("Exit at the CLOSE of the first candle that closes " + " / ".join(CLOUD_LABEL[k].lower() for k in cloud_list(cloud_exit_pick))
-                           + " - if target / stop loss is not hit first.")
+            cloud_exit_mode = "OR"
+            if cloud_exit_pick:                             # the AND | OR choice only matters when BOTH Target and Cloud exit are given
+                with cx2:
+                    cloud_exit_mode = st.radio("Target + Cloud exit", ["OR", "AND"], horizontal=True,
+                                               index=1 if str(R.get("cloud_exit_mode") or "").upper() == "AND" else 0,
+                                               key=K("bt_cloud_exit_mode"),
+                                               help="OR = exit when EITHER the target or the cloud exit is met (whichever comes first). "
+                                                    "AND = exit only when BOTH are met.")
+                _pos = " / ".join(CLOUD_LABEL[k].lower() for k in cloud_list(cloud_exit_pick))
+                if cloud_exit_mode == "AND":
+                    st.caption(f"AND: once the target is touched, exit at the CLOSE of the first candle that closes {_pos}. "
+                               "Stop loss and Max hold still exit the trade at any time.")
+                else:
+                    st.caption(f"OR: exit at the target, or at the CLOSE of the first candle that closes {_pos} - whichever comes first. "
+                               "Stop loss and Max hold still apply.")
+        with st.container(border=True):
+            _section("Brokerage", "charged on the buy value and the sell value (0 = no brokerage)")
+            b1, b2, _b3 = st.columns(3)
+            brokerage_buy_pct = b1.number_input("Buy leg brokerage (%)", min_value=0.0, max_value=5.0, step=0.01, format="%.2f",
+                                                value=float(R.get("brokerage_buy_pct", BROKERAGE_BUY_PCT)), key=K("bt_brk_buy"),
+                                                help="Buy order brokerage = Buy value x this %   (Buy value = entry price x qty)")
+            brokerage_sell_pct = b2.number_input("Sell leg brokerage (%)", min_value=0.0, max_value=5.0, step=0.01, format="%.2f",
+                                                 value=float(R.get("brokerage_sell_pct", BROKERAGE_SELL_PCT)), key=K("bt_brk_sell"),
+                                                 help="Sell order brokerage = Sell value x this %   (Sell value = exit price x qty)")
         run = st.button("▶ Run backtest", type="primary", key=K("bt_run"))
 
     # everything the form holds right now - saved with the file so Open / Edit can bring it back
@@ -2069,7 +2347,9 @@ def backtest_page():
              "position_amount": float(position_amount) if position_amount else None,
              "position_qty": int(position_qty) if position_qty else None,
              "target_pct": float(target_pct) if target_pct else None, "sl_pct": float(sl_pct or 0),
-             "max_hold": int(max_hold), "cloud_exit_sel": list(cloud_exit_sel)}
+             "max_hold": int(max_hold), "cloud_exit_sel": list(cloud_exit_sel),
+             "cloud_exit_mode": cloud_exit_mode,
+             "brokerage_buy_pct": float(brokerage_buy_pct), "brokerage_sell_pct": float(brokerage_sell_pct)}
 
     # ---------------- WHERE THE RESULT IS SAVED (top of the page) - the save itself happens after Run backtest ----------------
     with save_box:
@@ -2108,10 +2388,11 @@ def backtest_page():
                     "max_open": int(max_open), "no_limit": no_limit, "position_amount": float(position_amount or 0),
                     "size_mode": size_mode, "position_qty": int(position_qty or 0), "target_pct": float(target_pct),
                     "sl_pct": float(sl_pct or 0), "max_hold": int(max_hold), "patterns": list(picked_pats),
-                    "cloud_filter": cloud_pick, "cloud_exit": cloud_exit_pick,
+                    "cloud_filter": cloud_pick, "cloud_exit": cloud_exit_pick, "cloud_exit_mode": cloud_exit_mode,
+                    "brokerage_buy_pct": float(brokerage_buy_pct), "brokerage_sell_pct": float(brokerage_sell_pct),
                     "entry_times": entry_times, "exit_at": exit_at}
             cfg = _cfg_from_data(data)
-            cfg.slippage_pct, cfg.brokerage_pct = 0.0, 0.0          # costs removed from the UI
+            cfg.slippage_pct, cfg.brokerage_pct = 0.0, 0.0          # slippage stays off; brokerage = buy / sell leg % above
             bar = st.progress(0.0, text="Loading history...")
 
             def _prog(n, total, sym):
@@ -2126,7 +2407,8 @@ def backtest_page():
                             f"{len(items)} stocks | target {target_pct}%"
                             + (f" | entry at {entry_times.replace(',', ', ')}" if entry_times else "")
                             + (f" | exit {exit_at}" if exit_at else "")
-                            + (f" | cloud exit {cloud_exit_pick.replace(',', '/')}" if cloud_exit_pick else ""))
+                            + (f" | cloud exit {cloud_exit_pick.replace(',', '/')} ({cloud_exit_mode})" if cloud_exit_pick else ""))
+            ss.pop("bt_cmp_idx", None)                               # index comparison starts from this run's index
             ss["bt_result"] = res
             # AUTO SAVE: the finished run goes to Strategies (folder / file chosen at the top)
             if not _safe_name(file_name):
