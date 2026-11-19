@@ -687,11 +687,30 @@ MCX_MAIN = set("GOLD GOLDM GOLDPETAL SILVER SILVERM CRUDEOIL CRUDEOILM NATURALGA
 NFO_INDEX = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"}
 
 
-NSE_INDEX_FILES = {          # niftyindices.com constituent CSVs
+NSE_INDEX_FILES = {          # niftyindices.com constituent CSVs (name shown in the Index box -> file name)
+    # broad market
     "Nifty 50": "ind_nifty50list", "Nifty Next 50": "ind_niftynext50list", "Nifty 100": "ind_nifty100list",
-    "Nifty Bank": "ind_niftybanklist", "Nifty IT": "ind_niftyitlist", "Nifty Midcap 100": "ind_niftymidcap100list",
-    "Nifty Auto": "ind_niftyautolist", "Nifty Pharma": "ind_niftypharmalist", "Nifty FMCG": "ind_niftyfmcglist",
-    "Nifty Metal": "ind_niftymetallist", "Nifty Financial Services": "ind_niftyfinancelist",
+    "Nifty 200": "ind_nifty200list", "Nifty 500": "ind_nifty500list",
+    "Nifty Total Market": "ind_niftytotalmarket_list",
+    # mid / small / micro cap
+    "Nifty Midcap 50": "ind_niftymidcap50list", "Nifty Midcap 100": "ind_niftymidcap100list",
+    "Nifty Midcap 150": "ind_niftymidcap150list",
+    "Nifty Smallcap 50": "ind_niftysmallcap50list", "Nifty Smallcap 100": "ind_niftysmallcap100list",
+    "Nifty Smallcap 250": "ind_niftysmallcap250list",
+    "Nifty LargeMidcap 250": "ind_niftylargemidcap250list", "Nifty MidSmallcap 400": "ind_niftymidsmallcap400list",
+    "Nifty Microcap 250": "ind_niftymicrocap250_list",
+    # sectors
+    "Nifty Bank": "ind_niftybanklist", "Nifty Private Bank": "ind_nifty_privatebanklist",
+    "Nifty PSU Bank": "ind_niftypsubanklist", "Nifty Financial Services": "ind_niftyfinancelist",
+    "Nifty IT": "ind_niftyitlist", "Nifty Auto": "ind_niftyautolist", "Nifty Pharma": "ind_niftypharmalist",
+    "Nifty Healthcare": "ind_niftyhealthcarelist", "Nifty FMCG": "ind_niftyfmcglist",
+    "Nifty Metal": "ind_niftymetallist", "Nifty Realty": "ind_niftyrealtylist", "Nifty Energy": "ind_niftyenergylist",
+    "Nifty Oil & Gas": "ind_niftyoilgaslist", "Nifty Infrastructure": "ind_niftyinfralist",
+    "Nifty Media": "ind_niftymedialist", "Nifty Consumer Durables": "ind_niftyconsumerdurableslist",
+    # themes
+    "Nifty PSE": "ind_niftypselist", "Nifty CPSE": "ind_niftycpselist", "Nifty Commodities": "ind_niftycommoditieslist",
+    "Nifty India Consumption": "ind_niftyconsumptionlist", "Nifty MNC": "ind_niftymnclist",
+    "Nifty Services Sector": "ind_niftyservicesectorlist", "Nifty Alpha 50": "ind_niftyalpha50list",
 }
 MCX_GROUPS = {
     "Bullion": {"GOLD", "GOLDM", "SILVER", "SILVERM"},
@@ -719,13 +738,17 @@ def nse_index_members(index):
     f = NSE_INDEX_FILES.get(index)
     if not f:
         return []
-    try:
-        r = requests.get(f"https://niftyindices.com/IndexConstituent/{f}.csv",
-                         headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-        r.raise_for_status()
-        return [x.strip() for x in pd.read_csv(io.StringIO(r.text))["Symbol"].astype(str) if x.strip()]
-    except Exception:
-        return []
+    for url in (f"https://niftyindices.com/IndexConstituent/{f}.csv",
+                f"https://archives.nseindia.com/content/indices/{f}.csv"):
+        try:
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            r.raise_for_status()
+            out = [x.strip() for x in pd.read_csv(io.StringIO(r.text))["Symbol"].astype(str) if x.strip()]
+            if out:
+                return out
+        except Exception:
+            continue
+    return []
 
 
 def index_members(exchange, index):
@@ -1453,8 +1476,11 @@ def _bt_by_index(trades, imap, capital, tf_min):
 
 # ============================== INDEX COMPARISON (benchmark = the index's own candles from Angel One) ==============================
 POPULAR_INDICES = ("Nifty 50", "Nifty Bank", "SENSEX", "Nifty IT", "Nifty Next 50", "Nifty Midcap 100",
+                   "Nifty Smallcap 250", "Nifty 500",
                    "Nifty Financial Services", "Nifty Auto", "Nifty Pharma", "Nifty FMCG", "Nifty Metal")
-_INDEX_ALIAS = {"sensex30": "sensex", "niftyfinancialservices": "niftyfinservice"}     # setup name -> Angel One name (normalised)
+_INDEX_ALIAS = {"sensex30": "sensex", "niftyfinancialservices": "niftyfinservice",
+                "niftysmallcap50": "niftysmlcap50", "niftysmallcap100": "niftysmlcap100", "niftysmallcap250": "niftysmlcap250",
+                "niftymidsmallcap400": "niftymidsmlcap400", "niftytotalmarket": "niftytotalmkt"}     # setup name -> Angel One name (normalised)
 
 
 def _norm_name(s):
@@ -1962,6 +1988,52 @@ def env_creds():
     return None
 
 
+# ---- DEMO ID: one-click login on the login page, nobody has to type any key ----
+# Put the demo account's 4 details in ONE of these places (the first one found is used):
+#   1) Streamlit secrets  (.streamlit/secrets.toml  or  the Streamlit Cloud "Secrets" box):
+#        [demo]
+#        api_key = "..."
+#        client_id = "..."
+#        mpin = "..."
+#        totp_secret = "..."
+#   2) environment variables DEMO_API_KEY, DEMO_CLIENT_ID, DEMO_MPIN, DEMO_TOTP_SECRET
+#   3) the DEMO_FALLBACK line below (only if you accept the keys being written inside this file)
+DEMO_LABEL = "Demo ID"
+DEMO_FALLBACK = ("", "", "", "")                               # (api_key, client_id, mpin, totp_secret)
+
+
+def demo_creds():
+    try:
+        a = st.secrets["demo"]
+        c = tuple(str(a.get(k, "")).strip() for k in _LOGIN_KEYS)
+        if all(c):
+            return c
+    except Exception:
+        pass
+    c = tuple(os.getenv(k, "").strip() for k in ("DEMO_API_KEY", "DEMO_CLIENT_ID", "DEMO_MPIN", "DEMO_TOTP_SECRET"))
+    if all(c):
+        return c
+    c = tuple(str(x).strip() for x in DEMO_FALLBACK)
+    return c if all(c) else None
+
+
+def _demo_card():
+    """Demo ID row - one click logs in with the demo details, the visitor never sees or types a key."""
+    creds = demo_creds()
+    if not creds:
+        return
+    with st.container(border=True):
+        c_av, c_info, c_go = st.columns([0.6, 5, 1.6], vertical_alignment="center")
+        c_av.markdown("<div style='width:46px;height:46px;border-radius:50%;background:#3a2410;color:#f0a020;"
+                      "display:flex;align-items:center;justify-content:center;font-weight:700'>DM</div>",
+                      unsafe_allow_html=True)
+        c_info.markdown(f"<div style='font-weight:700;font-size:1.05rem;line-height:1.3'>{html.escape(DEMO_LABEL)}</div>"
+                        "<div style='opacity:.65;font-size:.92rem'>Click to login automatically - no keys needed</div>",
+                        unsafe_allow_html=True)
+        if c_go.button("▶ Login", key="demo_go", type="primary", use_container_width=True):
+            _connect(creds, False)                             # False = the demo details are never written to the saved-logins file
+
+
 def _last_used_text(stamp):
     try:
         d = datetime.strptime(str(stamp)[:10], "%Y-%m-%d").date()
@@ -1993,6 +2065,7 @@ def login_page():
     ss = st.session_state
     st.title("Angel One login")
     st.caption("Login is used only to download historical candles. No orders are placed.")
+    _demo_card()
     saved = list_saved_logins()
     if not saved:
         ss["login_new"] = True                                 # nobody saved yet -> normal login form directly
@@ -2237,23 +2310,49 @@ def backtest_page():
                                       help="One stock name or symbol per row in the first column (a header row is optional). "
                                            "Any stock of the chosen exchange works - it does not have to be in the selected index. "
                                            "Excel: first sheet is read.")
-                up_rows, up_miss = [], []
+                uni_ = exchange_universe(exchange)
+                by_lb_ = {r["label"]: r for r in uni_.to_dict("records")}
+                up_rows, up_miss, base_up, up_src = [], [], [], ""
                 if up is not None:
                     try:
-                        up_rows, up_miss = match_stock_names(read_stock_names(up), exchange_universe(exchange))
+                        _m_rows, up_miss = match_stock_names(read_stock_names(up), uni_)
+                        base_up = [r["label"] for r in _m_rows]
+                        up_src = up.name
                     except Exception as ex:
                         st.error(f"Could not read the file: {ex}")
-                    if up_rows or up_miss:
-                        st.caption(f"📄 {up.name}: {len(up_rows)} stocks matched" + (f", {len(up_miss)} not found" if up_miss else ""))
+                elif rx.get("upload_names"):                        # a saved strategy brings its file stocks back into the box
+                    base_up = [x for x in rx["upload_names"] if x in by_lb_]
+                    up_src = "the saved strategy"
+                if up is not None or base_up:
+                    # STOCKS BOX: the stocks of the file as chips. x on a chip removes it; type in the box to ADD any other stock.
+                    sig = hashlib.md5(up.getvalue()).hexdigest()[:8] if up is not None else "saved"
+                    ub_key = K(f"bt_upbox_{exchange}_{sig}")        # new file -> new box (starts from that file's stocks)
+                    if ub_key not in ss:
+                        ss[ub_key] = list(base_up)
+                    ss[ub_key] = [x for x in ss[ub_key] if x in by_lb_]
+                    cur_up = ss[ub_key]
+                    n_file = sum(1 for x in cur_up if x in set(base_up))
+                    n_new = len(cur_up) - n_file
+                    n_gone = len(base_up) - n_file
+                    st.markdown("<style>.st-key-bt_upbox_wrap [data-baseweb='select'] > div:first-child"
+                                "{max-height:150px;overflow-y:auto}</style>", unsafe_allow_html=True)
+                    with st.container(border=True, key="bt_upbox_wrap"):
+                        hb1, hb2 = st.columns([5, 1.6], vertical_alignment="center")
+                        hb1.markdown(f"✅ **Stocks added from {html.escape(up_src)}** · {len(cur_up)}")
+                        hb2.button("Reset to file", key=f"{ub_key}__reset", type="tertiary", use_container_width=True,
+                                   on_click=lambda k_=ub_key, v_=list(base_up): ss.__setitem__(k_, v_))
+                        st.multiselect("Stocks from the file", list(by_lb_), key=ub_key, label_visibility="collapsed",
+                                       placeholder="Type a stock name to add more stocks here")
+                        bits = [f"{n_file} from the file"]
+                        if n_new:
+                            bits.append(f"{n_new} added by you")
+                        if n_gone:
+                            bits.append(f"{n_gone} removed")
+                        st.caption(" · ".join(bits) + "   (✕ on a stock removes it, type in the box to add a new one)")
                     if up_miss:
-                        with st.expander(f"{len(up_miss)} names not found in {exchange}"):
-                            st.write(", ".join(up_miss[:200]) + (" ..." if len(up_miss) > 200 else ""))
-                elif rx.get("upload_names"):
-                    if st.checkbox(f"Use the {len(rx['upload_names'])} stocks from the file saved with this strategy (upload a new file to replace them)",
-                                   value=True, key=K("bt_use_saved_up")):
-                        uni_ = exchange_universe(exchange)
-                        by_lb_ = {r["label"]: r for r in uni_.to_dict("records")}
-                        up_rows = [by_lb_[x] for x in rx["upload_names"] if x in by_lb_]
+                        st.warning(f"{len(up_miss)} names not found in {exchange}: " + ", ".join(up_miss[:200])
+                                   + (" ..." if len(up_miss) > 200 else ""), icon="⚠️")
+                    up_rows = [by_lb_[x] for x in cur_up]
                 up_labels = [r["label"] for r in up_rows]
                 names, miss = list(picked), []
                 for t in [x.strip().upper() for x in typed.split(",") if x.strip()]:
@@ -2272,7 +2371,8 @@ def backtest_page():
                         have_.add(r_["label"])
                         items.append(to_item(r_, exchange))
                 index_map = build_index_map(items, exchange, index_pick) if len(index_pick) >= 2 else {}
-                st.caption(f"✅ Total {len(items)} stocks selected (of {len(labels)} in the chosen index list)")
+                st.caption(f"✅ Total {len(items)} stocks selected (of {len(labels)} in the chosen index list)"
+                           + (f" · {len(up_labels)} from the file box" if up_labels else ""))
             picked_pats = _stock_picker(f"Candle patterns ({len(PATTERNS)})", list(PATTERNS), K("bt_patterns"),
                                         default=R.get("patterns") or list(PATTERNS), button_label="Select candle patterns")
             cl1, _c2, _c3 = st.columns(3)
