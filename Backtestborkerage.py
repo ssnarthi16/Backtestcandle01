@@ -192,6 +192,11 @@ class Config:
     brokerage_pct: float = BROKERAGE_PCT
     brokerage_buy_pct: float = BROKERAGE_BUY_PCT      # % of buy value (entry x qty) charged on the buy order
     brokerage_sell_pct: float = BROKERAGE_SELL_PCT    # % of sell value (exit x qty) charged on the sell order
+    brokerage_on: bool = True                       # False = no brokerage at all (switch in Results)
+    brokerage_mode: str = "pct"                      # "pct" = % of trade value | "flat" = rupees per order
+    brokerage_buy_flat: float = 0.0                 # flat mode: rupees charged on every buy order
+    brokerage_sell_flat: float = 0.0                # flat mode: rupees charged on every sell order
+    compound: bool = False                          # True = every new position is sized from CURRENT equity (profits re-invested)
     slippage_pct: float = SLIPPAGE_PCT
     interval: str = "FIVE_MINUTE"
     tf_min: int = 5
@@ -220,15 +225,21 @@ class Config:
             return f"qty/position {int(self.position_qty)}"
         return ("equal weight " if self.size_mode == "equal" else "amount/position ") + f"{self.per_position:,.0f}"
 
-    def size_qty(self, one_lot, lot, cash):
-        """(qty the sizing rule alone allows, qty after the free-cash cap) - in shares (lots x lot size for NFO/MCX)."""
+    def size_qty(self, one_lot, lot, cash, equity=None):
+        """(qty the sizing rule alone allows, qty after the free-cash cap) - in shares (lots x lot size for NFO/MCX).
+           NORMAL   : the size of every position comes from the STARTING capital (fixed).
+           COMPOUND : the amount / qty is scaled by (current equity / starting capital) - profits are re-invested,
+                      losses make the next positions smaller. Qty mode: the qty is scaled the same way and rounded down."""
+        f = 1.0
+        if self.compound and equity is not None and self.capital > 0:
+            f = max(float(equity), 0.0) / self.capital
         if self.size_mode == "qty":
-            n = max(int(self.position_qty), 0)
+            n = max(int(math.floor(self.position_qty * f + 1e-9)), 0)
             n_cash = math.floor(max(cash, 0) / one_lot) if one_lot > 0 else 0
             return n * lot, min(n, n_cash) * lot
-        return (math.floor(self.per_position / one_lot) * lot,
-                math.floor(min(self.per_position, cash) / one_lot) * lot)
-
+        per = self.per_position * f
+        return (math.floor(per / one_lot) * lot,
+                math.floor(min(per, cash) / one_lot) * lot)
 
 def _cfg_from_data(d):
     """Config from a saved config.json dict (paper and live files)."""
@@ -242,12 +253,18 @@ def _cfg_from_data(d):
         position_amount=float(d.get("position_amount") or 0),
         size_mode=str(d.get("size_mode") or "amount"),
         position_qty=int(d.get("position_qty") or 0),
-        n_stocks=len(d.get("items") or []),
+        n_stocks=int(d.get("n_stocks") or len(d.get("items") or [])),
         no_limit=bool(d.get("no_limit", False)),
         cloud_filter=cloud_text(d.get("cloud_filter")),
         cloud_exit=cloud_text(d.get("cloud_exit")),
         brokerage_buy_pct=float(d.get("brokerage_buy_pct", BROKERAGE_BUY_PCT) or 0),
         brokerage_sell_pct=float(d.get("brokerage_sell_pct", BROKERAGE_SELL_PCT) or 0),
+        brokerage_on=bool(d.get("brokerage_on", True)),
+        brokerage_mode="flat" if str(d.get("brokerage_mode") or "").lower() == "flat" else "pct",
+        brokerage_buy_flat=float(d.get("brokerage_buy_flat") or 0),
+        brokerage_sell_flat=float(d.get("brokerage_sell_flat") or 0),
+        compound=bool(d.get("compound", False)),
+        slippage_pct=float(d.get("slippage_pct") or 0),
         cloud_exit_mode="AND" if str(d.get("cloud_exit_mode") or "").upper() == "AND" else "OR",
         entry_times=str(d.get("entry_times") or ""),
         exit_at=str(d.get("exit_at") or ""),
@@ -1216,17 +1233,42 @@ def _bt_candidates(it, df, cfg, start, end, order):
     return cands, skipped
 
 
-def _bt_portfolio(cands, cfg, exits_for):
-    """Replays the entries in time order with ONE shared capital / max-position pool (like Engine._enter)."""
+def _brokerage(cfg, buy_value, sell_value):
+    """(buy-leg brokerage, sell-leg brokerage).  Off -> 0.   "pct": value x %   |   "flat": rupees per order."""
+    if not cfg.brokerage_on:
+        return 0.0, 0.0
+    if cfg.brokerage_mode == "flat":
+        return float(cfg.brokerage_buy_flat), float(cfg.brokerage_sell_flat)
+    return buy_value * cfg.brokerage_buy_pct / 100, sell_value * cfg.brokerage_sell_pct / 100
+
+
+def _ts(v):
+    """Timestamp / ISO text / NaT / None -> naive Timestamp (or None)."""
+    if v is None or (not isinstance(v, str) and pd.isna(v)) or (isinstance(v, str) and not v.strip()):
+        return None
+    t = pd.Timestamp(v)
+    return t.tz_localize(None) if t.tzinfo is not None else t
+
+
+def _bt_portfolio(cands, cfg):
+    """Replays the entries in time order with ONE shared capital / max-position pool (like Engine._enter).
+       Every candidate already carries its exit ("hit" = price, time, reason, release time) - the exit does not depend on the
+       position size or the brokerage - so the same signals can be replayed again with other compound / brokerage settings
+       without touching the candle data."""
     cands = sorted(cands, key=lambda r: (r["etime"], r["order"]))
     open_, closed, skipped = [], [], []
+    realized = 0.0                                          # net P&L of the positions that are already closed
     for c in cands:
         still = []
         for p in open_:                                    # positions that already exited free their slot + cash
-            (closed if p["_xt"] <= c["etime"] else still).append(p)
+            if p["_xt"] <= c["etime"]:
+                closed.append(p)
+                realized += p["pnl"]
+            else:
+                still.append(p)
         open_ = still
         rec = {k: c[k] for k in ("symbol", "exchange", "candle", "pattern", "cloud", "_et")}
-        it, ex = c["item"], c["exchange"]
+        ex = c["exchange"]
         if any(p["symbol"] == c["symbol"] and p["exchange"] == ex for p in open_):
             skipped.append({**rec, "status": "SKIPPED (already in position)"})
             continue
@@ -1234,37 +1276,91 @@ def _bt_portfolio(cands, cfg, exits_for):
             skipped.append({**rec, "status": f"SKIPPED (positions full {len(open_)}/{cfg.max_open})"})
             continue
         entry = c["entry_raw"] * (1 + cfg.slippage_pct / 100)
-        lot, mf = int(it.get("lot", 1)), margin_factor(ex)
-        cash = (cfg.capital + sum(p["pnl"] for p in closed)
-                - sum(p["entry"] * p["qty"] * p["_mf"] for p in open_))
-        _, qty = cfg.size_qty(entry * lot * mf, lot, cash)
+        lot, mf = int(c.get("lot", 1)), margin_factor(ex)
+        equity = max(cfg.capital + realized, 0.0)           # COMPOUND: the new position is sized from this
+        cash = cfg.capital + realized - sum(p["entry"] * p["qty"] * p["_mf"] for p in open_)
+        _, qty = cfg.size_qty(entry * lot * mf, lot, cash, equity)
         if qty < 1:
             skipped.append({**rec, "status": f"SKIPPED (1 unit needs {entry * lot * mf:,.0f}; {cfg.size_text}, free cash {cash:,.0f})"})
             continue
-        tgt = round(entry * (1 + cfg.target_pct / 100), 2)
-        sl = round(entry * (1 - cfg.sl_pct / 100), 2) if cfg.sl_pct > 0 else None
-        hit = exits_for(c, tgt, sl)
+        hit = c.get("hit")
         if hit is None:
             skipped.append({**rec, "status": "SKIPPED (no price data after entry)"})
             continue
         raw_px, xt, reason, release = hit
         exit_px = raw_px * (1 - cfg.slippage_pct / 100)
         buy_value, sell_value = entry * qty, exit_px * qty
-        brk_buy = buy_value * cfg.brokerage_buy_pct / 100          # buy leg  : buy value  x buy %
-        brk_sell = sell_value * cfg.brokerage_sell_pct / 100       # sell leg : sell value x sell %
-        pnl = (sell_value - buy_value) - brk_buy - brk_sell         # net P&L after both legs
+        brk_buy, brk_sell = _brokerage(cfg, buy_value, sell_value)     # optional - see Config.brokerage_on / brokerage_mode
+        gross = sell_value - buy_value                                  # P&L before brokerage
+        pnl = gross - brk_buy - brk_sell                                # net P&L after both legs
         open_.append({
             "symbol": c["symbol"], "exchange": ex, "pattern": c["pattern"], "cloud": c["cloud"],
             "signal_candle": c["candle"], "entry_time": c["etime"], "entry": round(entry, 2),
-            "target": tgt, "stop_loss": sl, "qty": int(qty), "invested": round(entry * qty * mf, 2),
+            "target": c["tgt"], "stop_loss": c["sl"], "qty": int(qty), "invested": round(entry * qty * mf, 2),
             "exit_time": xt, "exit": round(exit_px, 2), "reason": reason,
-            "brokerage_buy": round(brk_buy, 2), "brokerage_sell": round(brk_sell, 2),
+            "gross_pnl": round(gross, 2), "brokerage_buy": round(brk_buy, 2), "brokerage_sell": round(brk_sell, 2),
+            "brokerage_total": round(brk_buy + brk_sell, 2),
             "pnl": round(pnl, 2), "pnl_pct": round(pnl / buy_value * 100, 2),
             "_xt": release, "_mf": mf,
         })
         skipped.append({**rec, "status": "ENTERED"})
     closed += open_
     return closed, skipped
+
+
+REPLAY_CAND_COLS = ["symbol", "exchange", "lot", "order", "candle", "pattern", "cloud", "et", "etime", "entry_raw", "tgt", "sl",
+                    "has_hit", "x_px", "x_time", "x_reason", "x_release"]
+REPLAY_SIG_COLS = ["symbol", "exchange", "candle", "pattern", "cloud", "et", "status"]
+
+
+def _bt_make_replay(cands, sigs, cfg):
+    """Everything needed to replay a finished run with other compound / brokerage settings (no candle data needed):
+       one row per entry signal (entry price + its exit), the signals skipped before any sizing, and the settings of the run."""
+    rows = []
+    for c in cands:
+        h = c.get("hit")
+        rows.append({"symbol": c["symbol"], "exchange": c["exchange"], "lot": int(c["item"].get("lot", 1)), "order": int(c["order"]),
+                     "candle": c["candle"], "pattern": c["pattern"], "cloud": c["cloud"], "et": c.get("_et"), "etime": c["etime"],
+                     "entry_raw": float(c["entry_raw"]), "tgt": c["tgt"], "sl": c["sl"],
+                     "has_hit": h is not None, "x_px": h[0] if h else None, "x_time": h[1] if h else None,
+                     "x_reason": h[2] if h else "", "x_release": h[3] if h else None})
+    srows = [{"symbol": r["symbol"], "exchange": r["exchange"], "candle": r["candle"], "pattern": r["pattern"],
+              "cloud": r["cloud"], "et": r.get("_et"), "status": r["status"]} for r in sigs]
+    return {"cands": pd.DataFrame(rows, columns=REPLAY_CAND_COLS), "sigs": pd.DataFrame(srows, columns=REPLAY_SIG_COLS),
+            "cfg": asdict(cfg)}
+
+
+def bt_replay(replay, cfg):
+    """Replays the stored signals with the compound / brokerage settings of cfg -> (trades, signals)."""
+    cands = []
+    for r in replay["cands"].to_dict("records"):
+        hit = None
+        if bool(r.get("has_hit")):
+            hit = (float(r["x_px"]), _ts(r["x_time"]), str(r["x_reason"]), _ts(r["x_release"]))
+        sl = r.get("sl")
+        cands.append({"symbol": r["symbol"], "exchange": r["exchange"], "lot": int(r.get("lot") or 1), "order": int(r["order"]),
+                      "candle": _ts(r["candle"]), "pattern": r["pattern"], "cloud": r["cloud"], "_et": _ts(r.get("et")),
+                      "etime": _ts(r["etime"]), "entry_raw": float(r["entry_raw"]), "tgt": float(r["tgt"]),
+                      "sl": None if (sl is None or pd.isna(sl)) else float(sl), "hit": hit})
+    closed, entered = _bt_portfolio(cands, cfg)
+    sigs = [{"symbol": r["symbol"], "exchange": r["exchange"], "candle": _ts(r["candle"]), "pattern": r["pattern"],
+             "cloud": r["cloud"], "_et": _ts(r.get("et")), "status": r["status"]} for r in replay["sigs"].to_dict("records")]
+    # TIME CONDITION (optional) - applied LAST: every other condition (pattern, cloud, positions, cash...) has already passed;
+    # only the results whose entry time is one of the chosen times are shown.
+    t_set = {t for t in (_hhmm(x) for x in str(cfg.entry_times or "").split(",")) if t}
+    if t_set and int(cfg.tf_min) < 1440:
+        closed = [p for p in closed if pd.Timestamp(p["entry_time"]).time() in t_set]
+        sigs = [r for r in sigs if r.get("_et") is not None and pd.Timestamp(r["_et"]).time() in t_set]
+        entered = [r for r in entered if r.get("_et") is not None and pd.Timestamp(r["_et"]).time() in t_set]
+    for r in sigs + entered:
+        r.pop("_et", None)
+    trades = pd.DataFrame(closed).drop(columns=["_xt", "_mf"], errors="ignore")
+    if not trades.empty:
+        trades = trades.sort_values(["exit_time", "entry_time"]).reset_index(drop=True)
+    signals = pd.DataFrame(sigs + entered)
+    if not signals.empty:
+        signals = signals.sort_values(["candle", "symbol"]).reset_index(drop=True)
+    return trades, signals
 
 
 def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progress=None):
@@ -1325,41 +1421,46 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
         release = xt if reason == "Time exit" else min(xt + blen, deadline) if reason != "Open at end of data" else xt + blen
         return px, xt, reason, release
 
-    closed, entered = _bt_portfolio(cands, cfg, exits_for)
-    # TIME CONDITION (optional) - applied LAST: every other condition (pattern, cloud, positions, cash...) has already passed;
-    # only the results whose entry time is one of the chosen times are shown.
-    t_set = {t for t in (_hhmm(x) for x in cfg.entry_times.split(",")) if t}
-    if t_set and tf < pd.Timedelta(minutes=1440):
-        closed = [p for p in closed if pd.Timestamp(p["entry_time"]).time() in t_set]
-        sigs = [r for r in sigs if r.get("_et") is not None and pd.Timestamp(r["_et"]).time() in t_set]
-        entered = [r for r in entered if r.get("_et") is not None and pd.Timestamp(r["_et"]).time() in t_set]
-    for r in sigs + entered:
-        r.pop("_et", None)
-    trades = pd.DataFrame(closed).drop(columns=["_xt", "_mf"], errors="ignore")
-    if not trades.empty:
-        trades = trades.sort_values(["exit_time", "entry_time"]).reset_index(drop=True)
-    signals = pd.DataFrame(sigs + entered)
-    if not signals.empty:
-        signals = signals.sort_values(["candle", "symbol"]).reset_index(drop=True)
-    return {"trades": trades, "signals": signals, "errors": errors, "tf_min": int(cfg.tf_min)}
+    # the exit of every signal does not depend on the position size or the brokerage -> worked out once and stored, so Results can
+    # re-calculate Normal / Compound / another brokerage instantly (bt_replay) without loading any candle again
+    for c in cands:
+        entry = c["entry_raw"] * (1 + cfg.slippage_pct / 100)
+        c["tgt"] = round(entry * (1 + cfg.target_pct / 100), 2)
+        c["sl"] = round(entry * (1 - cfg.sl_pct / 100), 2) if cfg.sl_pct > 0 else None
+        c["hit"] = exits_for(c, c["tgt"], c["sl"])
+    replay = _bt_make_replay(cands, sigs, cfg)
+    trades, signals = bt_replay(replay, cfg)                # NORMAL result with the brokerage chosen in the setup
+    return {"trades": trades, "signals": signals, "errors": errors, "tf_min": int(cfg.tf_min), "replay": replay}
 
 
-def bt_stats(trades, capital):
+def bt_stats(trades, capital, compound=False):
+    """compound=True -> the drawdown is measured as % of the running equity peak (positions grow with the equity)."""
     if trades is None or trades.empty:
         return {}
     pnl = trades["pnl"].astype(float)
     win = pnl > 0
     gp, gl = pnl[win].sum(), -pnl[~win].sum()
-    eq = pnl.cumsum()
-    dd = (np.maximum(eq.cummax(), 0) - eq).max()
+    if "brokerage_buy" in trades.columns and "brokerage_sell" in trades.columns:
+        brk_buy, brk_sell = float(trades["brokerage_buy"].astype(float).sum()), float(trades["brokerage_sell"].astype(float).sum())
+    else:
+        brk_buy = brk_sell = 0.0
+    brk, net = brk_buy + brk_sell, float(pnl.sum())
+    gross = net + brk                                           # P&L before brokerage
+    eq = capital + pnl.cumsum()
+    peak = np.maximum(eq.cummax(), capital)
+    dd = float((peak - eq).max())
+    dd_pct = (float(np.nan_to_num(((peak - eq) / peak.where(peak > 0)).max() * 100)) if compound
+              else (float(dd / capital * 100) if capital else 0.0))
     return {
-        "net": float(pnl.sum()), "ret": float(pnl.sum() / capital * 100) if capital else 0.0,
+        "net": net, "ret": float(net / capital * 100) if capital else 0.0,
         "n": int(len(pnl)), "wins": int(win.sum()), "losses": int((~win).sum()),
         "win_rate": float(win.mean() * 100), "pf": float(gp / gl) if gl > 0 else float("inf") if gp > 0 else 0.0,
         "avg": float(pnl.mean()), "best": float(pnl.max()), "worst": float(pnl.min()),
         "avg_win": float(pnl[win].mean()) if win.any() else 0.0,
         "avg_loss": float(pnl[~win].mean()) if (~win).any() else 0.0,
-        "dd": float(dd), "dd_pct": float(dd / capital * 100) if capital else 0.0,
+        "dd": dd, "dd_pct": dd_pct,
+        "gross": gross, "brk": brk, "brk_buy": brk_buy, "brk_sell": brk_sell,
+        "brk_pct": float(brk / gross * 100) if gross > 0 else 0.0, "end": float(capital + net),
     }
 
 
@@ -1396,9 +1497,12 @@ def _bt_rank(trades, by, capital, tf_min):
     t["_open"] = (t["reason"] == "Open at end of data").astype(int)
     t["_win"] = (t["pnl"] > 0).astype(int)
     t["_hold"] = [_hold_bars(a, b, e, tf_min) for a, b, e in zip(t["entry_time"], t["exit_time"], t["exchange"])]
-    g = t.groupby(list(by)).agg(trades=("pnl", "count"), wins=("_win", "sum"), net_pnl=("pnl", "sum"),
-                                avg_pnl=("pnl", "mean"), still_open=("_open", "sum"),
-                                avg_hold_bars=("_hold", "mean")).reset_index()
+    has_brk = "brokerage_total" in t.columns
+    agg = dict(trades=("pnl", "count"), wins=("_win", "sum"), net_pnl=("pnl", "sum"),
+               avg_pnl=("pnl", "mean"), still_open=("_open", "sum"), avg_hold_bars=("_hold", "mean"))
+    if has_brk:
+        agg["brokerage"] = ("brokerage_total", "sum")
+    g = t.groupby(list(by)).agg(**agg).reset_index()
     g["win_rate"] = g["wins"] / g["trades"] * 100
     g["return_pct"] = g["net_pnl"] / capital * 100 if capital else 0.0
     g["open_pct"] = g["still_open"] / g["trades"] * 100
@@ -1411,16 +1515,18 @@ def _bt_rank(trades, by, capital, tf_min):
     g.loc[best, "tag"] = "BEST + SAFEST" if best == safe else "BEST"
     g = g.sort_values(["net_pnl"], ascending=False).reset_index(drop=True)
     g.insert(0, "rank", range(1, len(g) + 1))
-    cols = ["rank", *by, "tag", "trades", "win_rate", "net_pnl", "return_pct", "avg_pnl", "still_open", "open_pct", "avg_hold_bars"]
-    g = g[cols].round({"win_rate": 1, "net_pnl": 2, "return_pct": 2, "avg_pnl": 2, "open_pct": 1, "avg_hold_bars": 1})
+    cols = (["rank", *by, "tag", "trades", "win_rate", "net_pnl"] + (["brokerage"] if has_brk else [])
+            + ["return_pct", "avg_pnl", "still_open", "open_pct", "avg_hold_bars"])
+    g = g[cols].round({"win_rate": 1, "net_pnl": 2, "brokerage": 2, "return_pct": 2, "avg_pnl": 2, "open_pct": 1, "avg_hold_bars": 1})
     return g, g[g["tag"].str.contains("BEST")].iloc[0], g[g["tag"].str.contains("SAFEST")].iloc[0], enough
 
 
 def _bt_table(g):
     """Ranked table: the BEST / SAFEST rows are highlighted green."""
     hi = lambda r: ["background-color: rgba(46,160,67,0.28)" if r["tag"] else ""] * len(r)
-    return g.style.apply(hi, axis=1).format({"win_rate": "{:.1f}%", "return_pct": "{:+.2f}%", "open_pct": "{:.1f}%",
-                                             "net_pnl": "{:,.2f}", "avg_pnl": "{:,.2f}", "avg_hold_bars": "{:.1f}"})
+    fmt = {"win_rate": "{:.1f}%", "return_pct": "{:+.2f}%", "open_pct": "{:.1f}%", "net_pnl": "{:,.2f}",
+           "brokerage": "{:,.2f}", "avg_pnl": "{:,.2f}", "avg_hold_bars": "{:.1f}"}
+    return g.style.apply(hi, axis=1).format({k: v for k, v in fmt.items() if k in g.columns})
 
 
 def _bt_quick(trades, capital, tf_min):
@@ -1445,7 +1551,7 @@ def _bt_quick(trades, capital, tf_min):
                                                     if enough else f"Every {title.lower()} has fewer than {MIN_TRADES_BEST} trades - treat with caution."))
 
 
-def _bt_by_index(trades, imap, capital, tf_min):
+def _bt_by_index(trades, imap, capital, tf_min, compound=False):
     """Result split per index. A stock that belongs to two chosen indices counts in both."""
     t = trades.copy()
     t["index"] = t["symbol"].map(imap)
@@ -1458,7 +1564,7 @@ def _bt_by_index(trades, imap, capital, tf_min):
     st.dataframe(_bt_table(_bt_rank(t, ["index"], capital, tf_min)[0]), use_container_width=True, hide_index=True)
     pick = st.selectbox("See one index in detail", sorted(t["index"].unique()), key="bt_index_view")
     one = t[t["index"] == pick].drop(columns=["index"]).reset_index(drop=True)
-    s = bt_stats(one, capital)
+    s = bt_stats(one, capital, compound)
     c = st.columns(4)
     c[0].metric("Net P&L", f"{s['net']:,.0f}", f"{s['ret']:.2f}% of capital")
     c[1].metric("Trades", s["n"], f"{s['wins']}W / {s['losses']}L", delta_color="off")
@@ -1551,7 +1657,7 @@ def _bt_strategy_curve(trades, capital):
     return trades["pnl"].astype(float).groupby(x.dt.normalize()).sum().cumsum() / capital * 100
 
 
-def _bt_index_compare(res, trades, capital):
+def _bt_index_compare(res, trades, capital, compound=False):
     """'Compare with an index' box on top of the result: index chosen from Angel One's index list vs this backtest."""
     ss = st.session_state
     setup = res.get("setup") or {}
@@ -1592,8 +1698,8 @@ def _bt_index_compare(res, trades, capital):
             st.warning("No candle data for: " + ", ".join(miss))
         if not stats:
             return
-        s = bt_stats(trades, capital)
-        rows = [{"": "My backtest", "Return": f"{s['ret']:+.2f}%", "Max drawdown": f"-{s['dd_pct']:.2f}%",
+        s = bt_stats(trades, capital, compound)
+        rows = [{"": "My backtest (compound)" if compound else "My backtest", "Return": f"{s['ret']:+.2f}%", "Max drawdown": f"-{s['dd_pct']:.2f}%",
                  "From → To": f"{capital:,.0f} → {capital + s['net']:,.0f}", "My backtest vs index": ""}]
         for lb, x in stats.items():
             diff = s["ret"] - x["ret"]
@@ -1612,12 +1718,113 @@ def _bt_index_compare(res, trades, capital):
 ALL_INDICES = "All indices (combined)"
 
 
+def _bt_brokerage_box(replay, uid):
+    """Brokerage controls on top of the Results. Optional (switch) and editable - the whole Results re-calculates when a value
+       changes, nothing is downloaded again. The setup form only gives the starting values."""
+    c0 = replay.get("cfg") or {}
+    b0, s0 = float(c0.get("brokerage_buy_pct") or 0), float(c0.get("brokerage_sell_pct") or 0)
+    fb0, fs0 = float(c0.get("brokerage_buy_flat") or 0) or 20.0, float(c0.get("brokerage_sell_flat") or 0) or 20.0
+    flat0 = str(c0.get("brokerage_mode") or "") == "flat"
+    any0 = (float(c0.get("brokerage_buy_flat") or 0) > 0 or float(c0.get("brokerage_sell_flat") or 0) > 0) if flat0 else (b0 > 0 or s0 > 0)
+    on0 = bool(c0.get("brokerage_on", True)) and any0
+    modes = ["% of trade value", "₹ per order"]
+    K = lambda n: f"bt_rb_{n}_{uid}"
+    with st.container(border=True):
+        _section("Brokerage", "optional - change it here and every number below updates")
+        c1, c2, c3, c4 = st.columns([1.3, 1.5, 1.4, 1.4])
+        on = c1.toggle("Apply brokerage", value=on0, key=K("on"),
+                       help="Off = results without any brokerage (gross). On = brokerage is deducted from every trade.")
+        mode = c2.selectbox("Charged as", modes, index=1 if flat0 else 0, key=K("mode"), disabled=not on,
+                            help="% of trade value = buy value / sell value x %   |   ₹ per order = a fixed amount on each buy and each sell order")
+        flat = mode == modes[1]
+        if flat:
+            bf = c3.number_input("Buy order (₹)", min_value=0.0, step=1.0, format="%.2f", value=fb0, key=K("bf"), disabled=not on)
+            sf = c4.number_input("Sell order (₹)", min_value=0.0, step=1.0, format="%.2f", value=fs0, key=K("sf"), disabled=not on)
+            bp, sp = b0, s0
+        else:
+            bp = c3.number_input("Buy leg (%)", min_value=0.0, max_value=5.0, step=0.01, format="%.2f", value=b0, key=K("bp"), disabled=not on)
+            sp = c4.number_input("Sell leg (%)", min_value=0.0, max_value=5.0, step=0.01, format="%.2f", value=s0, key=K("sp"), disabled=not on)
+            bf, sf = fb0, fs0
+    return {"on": bool(on), "mode": "flat" if flat else "pct", "buy_pct": float(bp), "sell_pct": float(sp),
+            "buy_flat": float(bf), "sell_flat": float(sf)}
+
+
+def _bt_views(res, uid, brk):
+    """{'Normal': (trades, signals), 'Compound': (trades, signals)} - replayed with the brokerage chosen in Results (cached)."""
+    cache = st.session_state.setdefault("bt_replay_cache", {})
+    key = (uid, brk["on"], brk["mode"], brk["buy_pct"], brk["sell_pct"], brk["buy_flat"], brk["sell_flat"])
+    if key not in cache:
+        if len(cache) > 16:
+            cache.clear()
+        d = dict(res["replay"]["cfg"])
+        d.update(brokerage_on=brk["on"], brokerage_mode=brk["mode"], brokerage_buy_pct=brk["buy_pct"],
+                 brokerage_sell_pct=brk["sell_pct"], brokerage_buy_flat=brk["buy_flat"], brokerage_sell_flat=brk["sell_flat"])
+        with st.spinner("Recalculating..."):
+            cache[key] = {name: bt_replay(res["replay"], _cfg_from_data({**d, "compound": comp}))
+                          for name, comp in (("Normal", False), ("Compound", True))}
+    return cache[key]
+
+
+def _bt_compare_table(views, capital, show_brk):
+    """Normal and Compound side by side."""
+    rows = []
+    for name, (t, _sg) in views.items():
+        s = bt_stats(_bt_trades_view(t, show_brk), capital, name == "Compound")
+        if not s:
+            rows.append({"Result": name, "Net P&L": "0", "Return": "0.00%", "End capital": f"{capital:,.0f}", "Trades": 0})
+            continue
+        row = {"Result": name, "Net P&L": f"{s['net']:,.0f}", "Return": f"{s['ret']:+.2f}%", "End capital": f"{s['end']:,.0f}",
+               "Trades": s["n"], "Win rate": f"{s['win_rate']:.1f}%",
+               "Profit factor": "inf" if math.isinf(s["pf"]) else f"{s['pf']:.2f}",
+               "Max drawdown": f"-{s['dd_pct']:.2f}%"}
+        if show_brk:
+            row["Gross P&L"], row["Brokerage"] = f"{s['gross']:,.0f}", f"{s['brk']:,.0f}"
+        rows.append(row)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("Max drawdown: Normal = % of the starting capital, Compound = % from the highest equity reached "
+               "(compound positions grow, so a fixed rupee amount would not be comparable).")
+
+
+def _bt_trades_view(trades, show_brk):
+    """Trades for display: brokerage columns only when brokerage is applied (older saved files get them worked out)."""
+    t = trades.copy()
+    if show_brk and "brokerage_total" not in t.columns and {"brokerage_buy", "brokerage_sell"} <= set(t.columns):
+        t["brokerage_total"] = (t["brokerage_buy"] + t["brokerage_sell"]).round(2)
+        t["gross_pnl"] = (t["pnl"] + t["brokerage_total"]).round(2)
+    if not show_brk:
+        t = t.drop(columns=[c for c in ("gross_pnl", "brokerage_buy", "brokerage_sell", "brokerage_total") if c in t.columns])
+    return t
+
+
 def _bt_show(res, capital):
-    trades, signals = res["trades"], res["signals"]
+    ss = st.session_state
     for e in res["errors"][:15]:
         st.warning(e)
     if len(res["errors"]) > 15:
         st.caption(f"... and {len(res['errors']) - 15} more data warnings")
+    uid = res.setdefault("_uid", time.time_ns())            # new run / opened file -> fresh Results widgets
+    replay = res.get("replay")
+    compound, view_name = False, "normal"
+    if replay and replay.get("cfg"):
+        brk = _bt_brokerage_box(replay, uid)                 # optional + editable brokerage
+        views = _bt_views(res, uid, brk)
+        show_brk = brk["on"]
+        mode = st.radio("Result type", ["Normal", "Compound"], horizontal=True, key=f"bt_mode_{uid}",
+                        help="Normal = every position is sized from the STARTING capital.  Compound = profits / losses are "
+                             "re-invested: every new position is sized from the CURRENT capital (starting capital + net P&L of "
+                             "the closed trades). Qty mode: the qty is scaled the same way and rounded down.")
+        compound, view_name = mode == "Compound", mode.lower()
+        _bt_compare_table(views, capital, show_brk)
+        trades, signals = views[mode]
+        st.caption(("COMPOUND: every new position is sized from the current capital (starting capital + closed P&L)."
+                    if compound else "NORMAL: every position is sized from the starting capital (profits are not re-invested)."))
+    else:
+        trades, signals = res["trades"], res["signals"]
+        show_brk = bool({"brokerage_buy", "brokerage_sell"} <= set(trades.columns)
+                        and (trades["brokerage_buy"].sum() + trades["brokerage_sell"].sum()) > 0)
+        st.info("This result was saved by an older version, so Compound and editable brokerage are not available for it. "
+                "Run the backtest again (Edit in Strategies) to get them.")
+    trades = _bt_trades_view(trades, show_brk)
     imap = res.get("index_map") or {}
     if imap:                                                 # 2+ indices were chosen -> list them; default = full combined result
         ix_list = sorted({ix for v in imap.values() for ix in v})
@@ -1640,18 +1847,26 @@ def _bt_show(res, capital):
         if signals is not None and not signals.empty:
             st.dataframe(signals, use_container_width=True, hide_index=True)
         return
-    _bt_index_compare(res, trades, capital)                  # index (from Angel One) vs this backtest, on top of the result
-    s = bt_stats(trades, capital)
+    _bt_index_compare(res, trades, capital, compound)        # index (from Angel One) vs this backtest, on top of the result
+    s = bt_stats(trades, capital, compound)
     r1 = st.columns(4)
-    r1[0].metric("Net P&L", f"{s['net']:,.0f}", f"{s['ret']:.2f}% of capital")
+    r1[0].metric("Net P&L" if show_brk else "P&L", f"{s['net']:,.0f}", f"{s['ret']:.2f}% of capital")
     r1[1].metric("Trades", s["n"], f"{s['wins']}W / {s['losses']}L", delta_color="off")
     r1[2].metric("Win rate", f"{s['win_rate']:.1f}%")
     r1[3].metric("Profit factor", "inf" if math.isinf(s["pf"]) else f"{s['pf']:.2f}")
+    rb = st.columns(4)
+    if show_brk:
+        rb[0].metric("Gross P&L (before brokerage)", f"{s['gross']:,.0f}")
+        rb[1].metric("Total brokerage", f"{s['brk']:,.0f}", f"{s['brk_pct']:.1f}% of gross profit" if s["gross"] > 0 else None,
+                     delta_color="off")
+        rb[2].metric("Buy / sell brokerage", f"{s['brk_buy']:,.0f} / {s['brk_sell']:,.0f}")
+    rb[3].metric("End capital", f"{s['end']:,.0f}", f"{s['ret']:+.2f}%")
     r2 = st.columns(4)
     r2[0].metric("Avg P&L / trade", f"{s['avg']:,.0f}")
     r2[1].metric("Avg win / avg loss", f"{s['avg_win']:,.0f} / {s['avg_loss']:,.0f}")
     r2[2].metric("Best / worst trade", f"{s['best']:,.0f} / {s['worst']:,.0f}")
-    r2[3].metric("Max drawdown", f"{s['dd']:,.0f}", f"-{s['dd_pct']:.2f}% of capital", delta_color="off")
+    r2[3].metric("Max drawdown", f"{s['dd']:,.0f}",
+                 f"-{s['dd_pct']:.2f}% from equity peak" if compound else f"-{s['dd_pct']:.2f}% of capital", delta_color="off")
 
     tf_min = int(res.get("tf_min", 5))
     _bt_quick(trades, capital, tf_min)
@@ -1665,10 +1880,10 @@ def _bt_show(res, capital):
     t_tr, t_sg, t_st, t_pt, t_bc, t_dy = tabs[:6]
     if imap:
         with tabs[6]:
-            _bt_by_index(trades, imap, capital, tf_min)
+            _bt_by_index(trades, imap, capital, tf_min, compound)
     with t_tr:
         st.dataframe(trades, use_container_width=True, hide_index=True)
-        _csv_button("⬇ Trades CSV", trades, "backtest_trades", "bt_dl_trades")
+        _csv_button("⬇ Trades CSV", trades, f"backtest_trades_{view_name}", "bt_dl_trades")
     with t_sg:
         if signals is not None and not signals.empty:
             st.caption(signals["status"].str.replace(r"\s*\(.*", "", regex=True).value_counts().to_dict())
@@ -1683,11 +1898,15 @@ def _bt_show(res, capital):
         st.dataframe(_bt_table(_bt_rank(trades, ["symbol", "pattern"], capital, tf_min)[0]), use_container_width=True, hide_index=True)
     with t_dy:
         d = trades.assign(day=pd.to_datetime(trades["exit_time"]).dt.date)
-        day = d.groupby("day")["pnl"].agg(trades="count", net_pnl="sum").round(2).reset_index()
+        dagg = dict(trades=("pnl", "count"), net_pnl=("pnl", "sum"))
+        if "brokerage_total" in d.columns:
+            dagg["brokerage"] = ("brokerage_total", "sum")
+        day = d.groupby("day").agg(**dagg).round(2).reset_index()
         st.bar_chart(day.set_index("day")["net_pnl"])
         st.dataframe(day, use_container_width=True, hide_index=True)
     st.caption("Backtest = history replay with today's index members (survivorship bias), entry at next candle open, "
-               "SL checked before target inside one candle. Live paper results can differ slightly.")
+               "SL checked before target inside one candle. Live paper results can differ slightly. "
+               "Brokerage changes made in Results are not stored in the saved file - the file keeps the brokerage used in the run.")
 
 
 # ============================== SAVED STRATEGIES (folders -> files) ==============================
@@ -1799,6 +2018,19 @@ def _df_unpack(p):
     return df
 
 
+def _replay_pack(rp):
+    """Replay data (signals + their exits + run settings) -> json-able. Lets a saved file still switch Normal / Compound and edit the brokerage."""
+    if not rp:
+        return None
+    return {"cands": _df_pack(rp["cands"]), "sigs": _df_pack(rp["sigs"]), "cfg": rp["cfg"]}
+
+
+def _replay_unpack(p):
+    if not p:
+        return None
+    return {"cands": _df_unpack(p.get("cands")), "sigs": _df_unpack(p.get("sigs")), "cfg": p.get("cfg") or {}}
+
+
 def save_strategy(folder, fname, setup, res):
     """Create / replace folder/file. Returns True when an existing file was replaced."""
     d, stem = _folder_dir(folder), _safe_name(fname)
@@ -1818,7 +2050,7 @@ def save_strategy(folder, fname, setup, res):
         _write_json(resf, {"trades": _df_pack(trades), "signals": _df_pack(res.get("signals")),
                            "errors": list(res.get("errors") or []), "tf_min": res.get("tf_min"),
                            "capital": res.get("capital"), "label": res.get("label"),
-                           "index_map": res.get("index_map") or {}})
+                           "index_map": res.get("index_map") or {}, "replay": _replay_pack(res.get("replay"))})
     elif os.path.exists(resf):
         os.remove(resf)                                        # replaced by a setup-only save -> no stale result
     _write_json(main, {"name": stem, "saved_at": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1839,7 +2071,8 @@ def load_strategy(folder, stem):
             r = json.load(f)
         res = {"trades": _df_unpack(r.get("trades")), "signals": _df_unpack(r.get("signals")),
                "errors": r.get("errors") or [], "tf_min": r.get("tf_min") or 5, "capital": r.get("capital"),
-               "label": r.get("label") or "", "index_map": r.get("index_map") or {}, "setup": meta.get("setup")}
+               "label": r.get("label") or "", "index_map": r.get("index_map") or {}, "setup": meta.get("setup"),
+               "replay": _replay_unpack(r.get("replay"))}
     return meta, res
 
 
@@ -2428,7 +2661,7 @@ def backtest_page():
                     st.caption(f"OR: exit at the target, or at the CLOSE of the first candle that closes {_pos} - whichever comes first. "
                                "Stop loss and Max hold still apply.")
         with st.container(border=True):
-            _section("Brokerage", "charged on the buy value and the sell value (0 = no brokerage)")
+            _section("Brokerage", "starting values (0 = no brokerage) - you can switch it off or change it in Results")
             b1, b2, _b3 = st.columns(3)
             brokerage_buy_pct = b1.number_input("Buy leg brokerage (%)", min_value=0.0, max_value=5.0, step=0.01, format="%.2f",
                                                 value=float(R.get("brokerage_buy_pct", BROKERAGE_BUY_PCT)), key=K("bt_brk_buy"),
