@@ -10,6 +10,7 @@ import re
 import shutil
 import threading
 import time
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from datetime import time as dtime
@@ -234,6 +235,10 @@ class Config:
         if self.compound and equity is not None and self.capital > 0:
             f = max(float(equity), 0.0) / self.capital
         if self.size_mode == "qty":
+            if self.compound and lot == 1:                   # COMPOUND + shares: fractional qty (1 -> 1.05 -> 1.10) so it really compounds
+                n = max(self.position_qty * f, 0.0)
+                n_cash = max(cash, 0) / one_lot if one_lot > 0 else 0.0
+                return n, min(n, n_cash)
             n = max(int(math.floor(self.position_qty * f + 1e-9)), 0)
             n_cash = math.floor(max(cash, 0) / one_lot) if one_lot > 0 else 0
             return n * lot, min(n, n_cash) * lot
@@ -1147,13 +1152,19 @@ def _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl, cx=None, S=None, mode="OR"):
     """Walk forward from bar i0. SL is checked before target inside a bar (same as _check_exit).
        cx (optional) = per-bar cloud-exit position ('' = no signal).
        mode "OR"  : the FIRST of target / cloud exit exits the trade (target at its price, cloud at that bar's close).
-       mode "AND" : BOTH must be satisfied. The target counts as satisfied once price has touched it (stays satisfied);
-                    the trade then exits at the close of the first bar that closes in a chosen cloud position
-                    (that same bar counts). SL and the time exit always stay active.
+       mode "AND" : BOTH must be satisfied, in ANY order. Each condition is remembered once it has happened:
+                      - target  = price touched the target %          (stays satisfied)
+                      - cloud   = a bar closed in a chosen cloud position (stays satisfied)
+                    The trade exits on the bar where the SECOND of the two is satisfied:
+                      - cloud was already hit, target now touched  -> exit at the target price (gap: bar open)
+                      - target was already hit, cloud now hit      -> exit at that bar's close
+                      - both become satisfied in the same bar      -> exit at that bar's close
+                    One condition alone never exits the trade. SL and the time exit always stay active.
        Returns (price, time, reason) or None when there is no bar to walk."""
     n, k, last = len(T), i0, None
     both = (mode == "AND" and cx is not None)
-    tgt_hit = False
+    tgt_hit = cld_hit = False
+    cx_seen = ""
     s0 = S[i0] if (S is not None and i0 < n) else None
     while k < n and T[k] < deadline:
         if S is not None and S[k] != s0 and last is not None:       # the contract rolled -> prices are no longer comparable
@@ -1164,10 +1175,19 @@ def _bt_exit(T, O, H, L, C, i0, deadline, tgt, sl, cx=None, S=None, mode="OR"):
             if L[k] <= sl:
                 return float(sl), T[k], "SL"
         if both:
+            was_tgt, was_cld = tgt_hit, cld_hit                     # what was already satisfied BEFORE this bar
             if not tgt_hit and H[k] >= tgt:                         # target touched -> satisfied from now on
                 tgt_hit = True
-            if tgt_hit and cx[k]:                                   # ... and a bar closes in the chosen cloud position
-                return float(C[k]), T[k], f"Target + Cloud ({cx[k]})"
+            if not cld_hit and cx[k]:                               # bar closes in a chosen cloud position -> satisfied from now on
+                cld_hit = True
+            if tgt_hit and cld_hit:                                 # BOTH satisfied (any order) -> exit now
+                if was_cld and not was_tgt and O[k] < tgt:          # cloud came first, target completes it -> exit AT the target
+                    return float(tgt), T[k], f"Cloud ({cx_seen}) + Target"
+                if was_cld and not was_tgt:                         # gapped up through the target
+                    return float(O[k]), T[k], f"Cloud ({cx_seen}) + Target (gap)"
+                return float(C[k]), T[k], f"Target + Cloud ({cx[k] or cx_seen})"
+            if cld_hit and not was_cld:
+                cx_seen = cx[k]                                     # remember which cloud position was hit
         else:
             if O[k] >= tgt:
                 return float(O[k]), T[k], "Target (gap)"
@@ -1280,7 +1300,8 @@ def _bt_portfolio(cands, cfg):
         equity = max(cfg.capital + realized, 0.0)           # COMPOUND: the new position is sized from this
         cash = cfg.capital + realized - sum(p["entry"] * p["qty"] * p["_mf"] for p in open_)
         _, qty = cfg.size_qty(entry * lot * mf, lot, cash, equity)
-        if qty < 1:
+        frac = cfg.compound and cfg.size_mode == "qty" and lot == 1      # fractional qty allowed (Compound, shares)
+        if qty < (1e-9 if frac else 1):
             skipped.append({**rec, "status": f"SKIPPED (1 unit needs {entry * lot * mf:,.0f}; {cfg.size_text}, free cash {cash:,.0f})"})
             continue
         hit = c.get("hit")
@@ -1296,7 +1317,7 @@ def _bt_portfolio(cands, cfg):
         open_.append({
             "symbol": c["symbol"], "exchange": ex, "pattern": c["pattern"], "cloud": c["cloud"],
             "signal_candle": c["candle"], "entry_time": c["etime"], "entry": round(entry, 2),
-            "target": c["tgt"], "stop_loss": c["sl"], "qty": int(qty), "invested": round(entry * qty * mf, 2),
+            "target": c["tgt"], "stop_loss": c["sl"], "qty": (round(float(qty), 4) if frac else int(qty)), "invested": round(entry * qty * mf, 2),
             "exit_time": xt, "exit": round(exit_px, 2), "reason": reason,
             "gross_pnl": round(gross, 2), "brokerage_buy": round(brk_buy, 2), "brokerage_sell": round(brk_sell, 2),
             "brokerage_total": round(brk_buy + brk_sell, 2),
@@ -1370,7 +1391,7 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
     warm = pd.Timedelta(days=CLOUD_DAYS.get(cfg.interval, 10) + 5)      # always load enough history for the reference cloud column
     tail = pd.Timedelta(days=int(cfg.max_hold) * 2 + 5)                                    # room for exits after To date
     load_to = min(end + tail, now_ist() + pd.Timedelta(days=1))
-    errors, cands, sigs, bars, cxs = [], [], [], {}, {}
+    errors, cands, sigs, bars, cxs, ohlc = [], [], [], {}, {}, {}
 
     def load(it):
         df = _bt_load_cont(smart, it, cfg.interval, start - warm, load_to)
@@ -1393,6 +1414,7 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
             if df is None or df.empty:
                 errors.append(f"{it['symbol']}: no candle data for this period")
                 continue
+            ohlc[(it["exchange"], it["symbol"])] = df[["date", "open", "high", "low", "close"]].copy()   # for the OHLC download
             c, s = _bt_candidates(it, df, cfg, start, end, order)
             cands += c
             sigs += s
@@ -1430,7 +1452,8 @@ def run_backtest(smart, cfg, items, exchange, d_from, d_to, precise=False, progr
         c["hit"] = exits_for(c, c["tgt"], c["sl"])
     replay = _bt_make_replay(cands, sigs, cfg)
     trades, signals = bt_replay(replay, cfg)                # NORMAL result with the brokerage chosen in the setup
-    return {"trades": trades, "signals": signals, "errors": errors, "tf_min": int(cfg.tf_min), "replay": replay}
+    return {"trades": trades, "signals": signals, "errors": errors, "tf_min": int(cfg.tf_min), "replay": replay,
+            "ohlc": ohlc, "period": (start, end)}          # loaded candles stay with this run only (not stored in the saved file)
 
 
 def bt_stats(trades, capital, compound=False):
@@ -1765,24 +1788,99 @@ def _bt_views(res, uid, brk):
     return cache[key]
 
 
-def _bt_compare_table(views, capital, show_brk):
-    """Normal and Compound side by side."""
+def _bt_result_table(both, capital, mode, show_brk):
+    """Normal AND Compound side by side (two rows) - the radio only decides which one the charts / tables below show.
+       both = {'Normal': trades, 'Compound': trades}."""
     rows = []
-    for name, (t, _sg) in views.items():
-        s = bt_stats(_bt_trades_view(t, show_brk), capital, name == "Compound")
+    for name in ("Normal", "Compound"):
+        t = both.get(name)
+        s = bt_stats(t, capital, name == "Compound") if (t is not None and not t.empty) else {}
         if not s:
-            rows.append({"Result": name, "Net P&L": "0", "Return": "0.00%", "End capital": f"{capital:,.0f}", "Trades": 0})
-            continue
-        row = {"Result": name, "Net P&L": f"{s['net']:,.0f}", "Return": f"{s['ret']:+.2f}%", "End capital": f"{s['end']:,.0f}",
-               "Trades": s["n"], "Win rate": f"{s['win_rate']:.1f}%",
-               "Profit factor": "inf" if math.isinf(s["pf"]) else f"{s['pf']:.2f}",
-               "Max drawdown": f"-{s['dd_pct']:.2f}%"}
-        if show_brk:
-            row["Gross P&L"], row["Brokerage"] = f"{s['gross']:,.0f}", f"{s['brk']:,.0f}"
+            row = {"Result": name, "Net P&L": "0", "Return": "0.00%", "End capital": f"{capital:,.0f}", "Trades": 0}
+        else:
+            row = {"Result": name, "Net P&L": f"{s['net']:,.0f}", "Return": f"{s['ret']:+.2f}%", "End capital": f"{s['end']:,.0f}",
+                   "Trades": s["n"], "Win rate": f"{s['win_rate']:.1f}%",
+                   "Profit factor": "inf" if math.isinf(s["pf"]) else f"{s['pf']:.2f}",
+                   "Max drawdown": f"-{s['dd_pct']:.2f}%"}
+            if "invested" in t.columns:                      # Compound positions grow / shrink with the equity - this shows it
+                row["Avg position"] = f"{float(t['invested'].astype(float).mean()):,.0f}"
+            if show_brk:
+                row["Gross P&L"], row["Brokerage"] = f"{s['gross']:,.0f}", f"{s['brk']:,.0f}"
         rows.append(row)
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     st.caption("Max drawdown: Normal = % of the starting capital, Compound = % from the highest equity reached "
-               "(compound positions grow, so a fixed rupee amount would not be comparable).")
+               "(compound positions grow, so a fixed rupee amount would not be comparable). "
+               f"The charts and tables below show the **{mode}** result.")
+
+
+def _bt_ohlc_files(res, only_period, syms=None):
+    """{file name: candles} of the OHLC data the backtest loaded - optionally only the chosen From-To period / only some stocks."""
+    items = [(ex, sy, d) for (ex, sy), d in (res.get("ohlc") or {}).items() if syms is None or sy in syms]
+    lo, hi = res.get("period") or (None, None)
+    dup = {}
+    for _ex, sy, _d in items:
+        dup[sy] = dup.get(sy, 0) + 1
+    out = {}
+    for ex, sy, d in sorted(items, key=lambda r: (r[1], r[0])):
+        x = d[(d["date"] >= lo) & (d["date"] < hi)] if (only_period and lo is not None) else d
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", sy if dup[sy] == 1 else f"{ex}_{sy}")
+        out[name] = (ex, sy, x.reset_index(drop=True))
+    return out
+
+
+def _bt_ohlc_tab(res, syms=None):
+    """Download the candles (date, open, high, low, close) that were loaded for the selected stocks."""
+    uid = res.get("_uid")
+    if not res.get("ohlc"):
+        of = res.get("ohlc_file")
+        if not (of and os.path.exists(of)):
+            st.info("No candle data is stored for this result (older save, or the run was too big to store). "
+                    "Run the backtest again - the candles of every new run are saved with it.")
+            return
+        mem = st.session_state.setdefault("bt_ohlc_saved", {})
+        if of not in mem:
+            st.caption("The candles of this run are saved with the file.")
+            if st.button("Load saved candles", key=f"bt_oh_load_{uid}"):
+                with st.spinner("Reading the saved candles..."):
+                    try:
+                        mem.clear()
+                        mem[of] = _ohlc_from_frame(pd.read_csv(of, parse_dates=["date"], dtype={"symbol": str, "exchange": str}))
+                    except Exception as ex:
+                        st.error(f"Could not read the saved candles: {ex}")
+                        return
+            else:
+                return
+        res = {**res, "ohlc": mem[of]}
+    scope = st.radio("Which candles", ["Only the selected period", "Whole loaded data"], horizontal=True, key=f"bt_oh_scope_{uid}",
+                     help="Whole loaded data = also the earlier days loaded for the cloud calculation and a few days after the "
+                          "To date (room for exits). Only the selected period = From to To date only.")
+    files = _bt_ohlc_files(res, scope == "Only the selected period", syms)
+    if not files:
+        st.info("No candle data for the chosen stocks.")
+        return
+    summ = pd.DataFrame([{"stock": sy, "exchange": ex, "candles": len(d),
+                          "first candle": d["date"].min() if len(d) else None, "last candle": d["date"].max() if len(d) else None}
+                         for ex, sy, d in files.values()])
+    st.caption(f"{len(files)} stocks, {int(summ['candles'].sum()):,} candles.")
+    st.dataframe(summ, use_container_width=True, hide_index=True)
+    cache = st.session_state.setdefault("bt_ohlc_cache", {})
+    key = (uid, scope, tuple(files))
+    if key not in cache:
+        if len(cache) > 6:
+            cache.clear()
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, (_ex, _sy, d) in files.items():
+                z.writestr(f"{name}.csv", d.to_csv(index=False))
+        allv = pd.concat([d.assign(symbol=sy, exchange=ex) for ex, sy, d in files.values()], ignore_index=True)
+        allv = allv[["symbol", "exchange", "date", "open", "high", "low", "close"]]
+        allv = allv.sort_values(["date", "symbol", "exchange"], kind="stable").reset_index(drop=True)   # date-wise: start date -> end date, stocks A-Z inside each candle time
+        cache[key] = (buf.getvalue(), allv.to_csv(index=False).encode())
+    zbytes, cbytes = cache[key]
+    c1, c2 = st.columns(2)
+    stamp = f"{now_ist():%Y%m%d}"
+    c1.download_button("⬇ ZIP - one CSV per stock", zbytes, f"backtest_ohlc_{stamp}.zip", "application/zip", key=f"bt_oh_zip_{uid}")
+    c2.download_button("⬇ One combined CSV", cbytes, f"backtest_ohlc_all_{stamp}.csv", "text/csv", key=f"bt_oh_csv_{uid}")
 
 
 def _bt_trades_view(trades, show_brk):
@@ -1804,7 +1902,7 @@ def _bt_show(res, capital):
         st.caption(f"... and {len(res['errors']) - 15} more data warnings")
     uid = res.setdefault("_uid", time.time_ns())            # new run / opened file -> fresh Results widgets
     replay = res.get("replay")
-    compound, view_name = False, "normal"
+    compound, view_name, mode, table_slot = False, "normal", "Normal", None
     if replay and replay.get("cfg"):
         brk = _bt_brokerage_box(replay, uid)                 # optional + editable brokerage
         views = _bt_views(res, uid, brk)
@@ -1814,7 +1912,7 @@ def _bt_show(res, capital):
                              "re-invested: every new position is sized from the CURRENT capital (starting capital + net P&L of "
                              "the closed trades). Qty mode: the qty is scaled the same way and rounded down.")
         compound, view_name = mode == "Compound", mode.lower()
-        _bt_compare_table(views, capital, show_brk)
+        table_slot = st.container()                          # filled below with the table of the selected result
         trades, signals = views[mode]
         st.caption(("COMPOUND: every new position is sized from the current capital (starting capital + closed P&L)."
                     if compound else "NORMAL: every position is sized from the starting capital (profits are not re-invested)."))
@@ -1826,6 +1924,8 @@ def _bt_show(res, capital):
                 "Run the backtest again (Edit in Strategies) to get them.")
     trades = _bt_trades_view(trades, show_brk)
     imap = res.get("index_map") or {}
+    ohlc_syms = None                                         # None = all loaded stocks in the OHLC download
+    sym_filter = None                                        # index filter -> applied to BOTH rows of the table
     if imap:                                                 # 2+ indices were chosen -> list them; default = full combined result
         ix_list = sorted({ix for v in imap.values() for ix in v})
         opts = [ALL_INDICES] + ix_list
@@ -1836,12 +1936,26 @@ def _bt_show(res, capital):
                                     "stats, charts and tables.")
         if pick_ix != ALL_INDICES:
             syms = {sy for sy, v in imap.items() if pick_ix in v}
+            ohlc_syms = syms
+            sym_filter = syms
             trades = trades[trades["symbol"].isin(syms)].reset_index(drop=True)
             if signals is not None and not signals.empty:
                 signals = signals[signals["symbol"].isin(syms)].reset_index(drop=True)
             res = {**res, "index_map": {}}                   # one index only -> no 'By index' comparison tab
             st.caption(f"Showing only **{pick_ix}** stocks ({len(syms)}). Numbers are a slice of the same combined run "
                        f"(shared capital / max positions); a stock in two indices shows under both.")
+    if table_slot is not None:                               # Normal -> Normal numbers, Compound -> Compound numbers
+        with table_slot:
+            both = {}
+            for _m in ("Normal", "Compound"):
+                _t = _bt_trades_view(views[_m][0], show_brk)
+                if sym_filter is not None:
+                    _t = _t[_t["symbol"].isin(sym_filter)].reset_index(drop=True)
+                both[_m] = _t
+            _bt_result_table(both, capital, mode, show_brk)
+            if str((replay.get("cfg") or {}).get("size_mode") or "amount") == "qty":
+                st.caption("Position = Qty: Normal uses the whole qty you entered; Compound scales it with the equity "
+                           "(qty x current capital / starting capital) and uses a fractional qty, e.g. 1 -> 1.05 -> 1.10.")
     if trades.empty:
         st.info("No trades in this period (no signal passed the filters). Try a longer period / more patterns / more stocks.")
         if signals is not None and not signals.empty:
@@ -1875,12 +1989,14 @@ def _bt_show(res, capital):
     st.line_chart(eq)
 
     imap = res.get("index_map") or {}
-    names = ["Trades", "Signals", "By stock", "By pattern", "Best combos", "By day"] + (["By index"] if imap else [])
+    names = ["Trades", "Signals", "By stock", "By pattern", "Best combos", "By day"] + (["By index"] if imap else []) + ["OHLC data"]
     tabs = st.tabs(names)
     t_tr, t_sg, t_st, t_pt, t_bc, t_dy = tabs[:6]
     if imap:
         with tabs[6]:
             _bt_by_index(trades, imap, capital, tf_min, compound)
+    with tabs[-1]:
+        _bt_ohlc_tab(res, ohlc_syms)
     with t_tr:
         st.dataframe(trades, use_container_width=True, hide_index=True)
         _csv_button("⬇ Trades CSV", trades, f"backtest_trades_{view_name}", "bt_dl_trades")
@@ -1912,9 +2028,13 @@ def _bt_show(res, capital):
 # ============================== SAVED STRATEGIES (folders -> files) ==============================
 # STRATEGIES_ROOT/<folder>/<file>.json       = name, saved time, setup (every input) and a small results summary
 # STRATEGIES_ROOT/<folder>/<file>.res.json   = the full result (trades, signals ...) - only read when a file is opened
+# STRATEGIES_ROOT/<folder>/<file>.ohlc.csv.gz = the candles (OHLC) that were loaded for this run - read only when 'Load saved candles' is clicked
 CREATE_FOLDER = "+ Create new folder"
 DEFAULT_FOLDER = "Unsorted"
 _RES_SUFFIX = ".res.json"
+_OHLC_SUFFIX = ".ohlc.csv.gz"
+_OHLC_COLS = ["symbol", "exchange", "date", "open", "high", "low", "close"]
+_OHLC_SAVE_MAX_ROWS = 3_000_000                           # bigger runs are not saved with the file (they stay downloadable until you leave)
 
 
 def _safe_name(s, maxlen=60):
@@ -2018,6 +2138,19 @@ def _df_unpack(p):
     return df
 
 
+def _ohlc_to_frame(ohlc):
+    """{(exchange, symbol): candles} -> one table (symbol, exchange, date, open, high, low, close)."""
+    parts = [d.assign(symbol=sy, exchange=ex)[_OHLC_COLS] for (ex, sy), d in ohlc.items()]
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=_OHLC_COLS)
+
+
+def _ohlc_from_frame(df):
+    out = {}
+    for (ex, sy), d in df.groupby(["exchange", "symbol"], sort=False):
+        out[(ex, sy)] = d[["date", "open", "high", "low", "close"]].reset_index(drop=True)
+    return out
+
+
 def _replay_pack(rp):
     """Replay data (signals + their exits + run settings) -> json-able. Lets a saved file still switch Normal / Compound and edit the brokerage."""
     if not rp:
@@ -2050,9 +2183,25 @@ def save_strategy(folder, fname, setup, res):
         _write_json(resf, {"trades": _df_pack(trades), "signals": _df_pack(res.get("signals")),
                            "errors": list(res.get("errors") or []), "tf_min": res.get("tf_min"),
                            "capital": res.get("capital"), "label": res.get("label"),
-                           "index_map": res.get("index_map") or {}, "replay": _replay_pack(res.get("replay"))})
+                           "index_map": res.get("index_map") or {}, "replay": _replay_pack(res.get("replay")),
+                           "period": res.get("period")})
+        ofile, ohlc = os.path.join(d, stem + _OHLC_SUFFIX), res.get("ohlc")
+        if ohlc and sum(len(x) for x in ohlc.values()) <= _OHLC_SAVE_MAX_ROWS:
+            try:                                               # the candles of this run, compressed, beside the result
+                tmp = ofile + ".tmp"
+                _ohlc_to_frame(ohlc).to_csv(tmp, index=False, compression="gzip")
+                os.replace(tmp, ofile)
+            except Exception:
+                if os.path.exists(ofile):
+                    os.remove(ofile)
+        elif res.get("ohlc_file") != ofile and os.path.exists(ofile):
+            os.remove(ofile)                                   # a different result replaced it -> no stale candles
     elif os.path.exists(resf):
         os.remove(resf)                                        # replaced by a setup-only save -> no stale result
+        try:
+            os.remove(os.path.join(d, stem + _OHLC_SUFFIX))
+        except OSError:
+            pass
     _write_json(main, {"name": stem, "saved_at": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
                        "setup": setup, "summary": summary, "has_result": res is not None})
     return existed
@@ -2073,6 +2222,11 @@ def load_strategy(folder, stem):
                "errors": r.get("errors") or [], "tf_min": r.get("tf_min") or 5, "capital": r.get("capital"),
                "label": r.get("label") or "", "index_map": r.get("index_map") or {}, "setup": meta.get("setup"),
                "replay": _replay_unpack(r.get("replay"))}
+        of = os.path.join(d, stem + _OHLC_SUFFIX)
+        if os.path.exists(of):
+            res["ohlc_file"] = of
+        if r.get("period"):
+            res["period"] = (pd.Timestamp(r["period"][0]), pd.Timestamp(r["period"][1]))
     return meta, res
 
 
@@ -2100,7 +2254,7 @@ def _cb_open_strategy(folder, stem, with_result):
 def _cb_delete_strategy(folder, stem):
     d = _folder_dir(folder)
     if d and os.path.basename(stem) == stem:
-        for suf in (".json", _RES_SUFFIX):
+        for suf in (".json", _RES_SUFFIX, _OHLC_SUFFIX):
             try:
                 os.remove(os.path.join(d, stem + suf))
             except OSError:
@@ -2652,10 +2806,11 @@ def backtest_page():
                                                index=1 if str(R.get("cloud_exit_mode") or "").upper() == "AND" else 0,
                                                key=K("bt_cloud_exit_mode"),
                                                help="OR = exit when EITHER the target or the cloud exit is met (whichever comes first). "
-                                                    "AND = exit only when BOTH are met.")
+                                                    "AND = exit only when BOTH are met (in any order) - one alone never exits.")
                 _pos = " / ".join(CLOUD_LABEL[k].lower() for k in cloud_list(cloud_exit_pick))
                 if cloud_exit_mode == "AND":
-                    st.caption(f"AND: once the target is touched, exit at the CLOSE of the first candle that closes {_pos}. "
+                    st.caption(f"AND: exit only after BOTH have happened (any order) - the target is touched AND a candle closes {_pos}. "
+                               "Exit is at the target price if the cloud came first, else at the CLOSE of the cloud candle. "
                                "Stop loss and Max hold still exit the trade at any time.")
                 else:
                     st.caption(f"OR: exit at the target, or at the CLOSE of the first candle that closes {_pos} - whichever comes first. "
