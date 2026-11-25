@@ -154,8 +154,11 @@ TREND_LOOKBACK = 0
 TWEEZER_TOL_PCT = 0.10
 FUTURES_MARGIN_PCT = 10.0
 BROKERAGE_PCT = 0.0
-BROKERAGE_BUY_PCT = 0.5     # brokerage on the BUY leg  = buy value  x this %
-BROKERAGE_SELL_PCT = 0.5    # brokerage on the SELL leg = sell value x this %
+BROKERAGE_BUY_PCT = 0.0     # a run has NO brokerage - it is chosen only in Results
+BROKERAGE_SELL_PCT = 0.0
+RESULT_BRK_BUY_PCT = 0.5    # starting values shown in the Results brokerage box (used only after "Apply brokerage" is switched on)
+RESULT_BRK_SELL_PCT = 0.5
+RESULT_BRK_FLAT = 20.0
 SLIPPAGE_PCT = 0.0
 FRESH_SECONDS = 120
 REFRESH_SECONDS = 5
@@ -218,7 +221,10 @@ class Config:
         if self.size_mode == "equal":
             n = max(self.n_stocks, 1) if self.no_limit else max(self.max_open, 1)
             return self.capital / n
-        return self.position_amount if self.position_amount > 0 else self.capital / self.max_open
+        if self.position_amount > 0:
+            return self.position_amount
+        denom = max(self.n_stocks, 1) if self.no_limit else max(self.max_open, 1)
+        return self.capital / denom
 
     @property
     def size_text(self):
@@ -1292,7 +1298,7 @@ def _bt_portfolio(cands, cfg):
         if any(p["symbol"] == c["symbol"] and p["exchange"] == ex for p in open_):
             skipped.append({**rec, "status": "SKIPPED (already in position)"})
             continue
-        if len(open_) >= cfg.max_open:
+        if not cfg.no_limit and cfg.max_open > 0 and len(open_) >= cfg.max_open:
             skipped.append({**rec, "status": f"SKIPPED (positions full {len(open_)}/{cfg.max_open})"})
             continue
         entry = c["entry_raw"] * (1 + cfg.slippage_pct / 100)
@@ -1746,17 +1752,19 @@ def _bt_brokerage_box(replay, uid):
        changes, nothing is downloaded again. The setup form only gives the starting values."""
     c0 = replay.get("cfg") or {}
     b0, s0 = float(c0.get("brokerage_buy_pct") or 0), float(c0.get("brokerage_sell_pct") or 0)
-    fb0, fs0 = float(c0.get("brokerage_buy_flat") or 0) or 20.0, float(c0.get("brokerage_sell_flat") or 0) or 20.0
+    fb0, fs0 = float(c0.get("brokerage_buy_flat") or 0) or RESULT_BRK_FLAT, float(c0.get("brokerage_sell_flat") or 0) or RESULT_BRK_FLAT
     flat0 = str(c0.get("brokerage_mode") or "") == "flat"
     any0 = (float(c0.get("brokerage_buy_flat") or 0) > 0 or float(c0.get("brokerage_sell_flat") or 0) > 0) if flat0 else (b0 > 0 or s0 > 0)
-    on0 = bool(c0.get("brokerage_on", True)) and any0
+    on0 = bool(c0.get("brokerage_on", True)) and any0      # a new run has no brokerage -> the switch starts OFF
+    if not any0:                                            # nothing was used in the run -> starting values for when it is switched on
+        b0, s0 = RESULT_BRK_BUY_PCT, RESULT_BRK_SELL_PCT
     modes = ["% of trade value", "₹ per order"]
     K = lambda n: f"bt_rb_{n}_{uid}"
     with st.container(border=True):
-        _section("Brokerage", "optional - change it here and every number below updates")
+        _section("Brokerage", "off by default - switch it on to deduct brokerage, every number below updates")
         c1, c2, c3, c4 = st.columns([1.3, 1.5, 1.4, 1.4])
         on = c1.toggle("Apply brokerage", value=on0, key=K("on"),
-                       help="Off = results without any brokerage (gross). On = brokerage is deducted from every trade.")
+                       help="Off = results without any brokerage (gross). On = brokerage is deducted from every trade and the brokerage columns appear.")
         mode = c2.selectbox("Charged as", modes, index=1 if flat0 else 0, key=K("mode"), disabled=not on,
                             help="% of trade value = buy value / sell value x %   |   ₹ per order = a fixed amount on each buy and each sell order")
         flat = mode == modes[1]
@@ -2774,7 +2782,7 @@ def backtest_page():
             max_pick = m1.selectbox("Max open positions", MAX_OPTS,
                                     index=MAX_OPTS.index(R["max_pick"]) if R.get("max_pick") in MAX_OPTS else 0, key=K("bt_max"))
             no_limit = max_pick == NO_LIMIT
-            max_open = 10 ** 6 if no_limit else int(max_pick)
+            max_open = 0 if no_limit else int(max_pick)
             def_amt = None if (no_limit or not capital) else round(capital / max_open, 2)
             if (R.get("size_mode") == "amount" and R.get("position_amount") and capital
                     and float(capital) == float(R.get("capital") or 0) and max_pick == R.get("max_pick")):
@@ -2815,15 +2823,6 @@ def backtest_page():
                 else:
                     st.caption(f"OR: exit at the target, or at the CLOSE of the first candle that closes {_pos} - whichever comes first. "
                                "Stop loss and Max hold still apply.")
-        with st.container(border=True):
-            _section("Brokerage", "starting values (0 = no brokerage) - you can switch it off or change it in Results")
-            b1, b2, _b3 = st.columns(3)
-            brokerage_buy_pct = b1.number_input("Buy leg brokerage (%)", min_value=0.0, max_value=5.0, step=0.01, format="%.2f",
-                                                value=float(R.get("brokerage_buy_pct", BROKERAGE_BUY_PCT)), key=K("bt_brk_buy"),
-                                                help="Buy order brokerage = Buy value x this %   (Buy value = entry price x qty)")
-            brokerage_sell_pct = b2.number_input("Sell leg brokerage (%)", min_value=0.0, max_value=5.0, step=0.01, format="%.2f",
-                                                 value=float(R.get("brokerage_sell_pct", BROKERAGE_SELL_PCT)), key=K("bt_brk_sell"),
-                                                 help="Sell order brokerage = Sell value x this %   (Sell value = exit price x qty)")
         run = st.button("▶ Run backtest", type="primary", key=K("bt_run"))
 
     # everything the form holds right now - saved with the file so Open / Edit can bring it back
@@ -2836,8 +2835,7 @@ def backtest_page():
              "position_qty": int(position_qty) if position_qty else None,
              "target_pct": float(target_pct) if target_pct else None, "sl_pct": float(sl_pct or 0),
              "max_hold": int(max_hold), "cloud_exit_sel": list(cloud_exit_sel),
-             "cloud_exit_mode": cloud_exit_mode,
-             "brokerage_buy_pct": float(brokerage_buy_pct), "brokerage_sell_pct": float(brokerage_sell_pct)}
+             "cloud_exit_mode": cloud_exit_mode}
 
     # ---------------- WHERE THE RESULT IS SAVED (top of the page) - the save itself happens after Run backtest ----------------
     with save_box:
@@ -2877,10 +2875,11 @@ def backtest_page():
                     "size_mode": size_mode, "position_qty": int(position_qty or 0), "target_pct": float(target_pct),
                     "sl_pct": float(sl_pct or 0), "max_hold": int(max_hold), "patterns": list(picked_pats),
                     "cloud_filter": cloud_pick, "cloud_exit": cloud_exit_pick, "cloud_exit_mode": cloud_exit_mode,
-                    "brokerage_buy_pct": float(brokerage_buy_pct), "brokerage_sell_pct": float(brokerage_sell_pct),
+                    "brokerage_buy_pct": 0.0, "brokerage_sell_pct": 0.0, "brokerage_on": False,
                     "entry_times": entry_times, "exit_at": exit_at}
             cfg = _cfg_from_data(data)
-            cfg.slippage_pct, cfg.brokerage_pct = 0.0, 0.0          # slippage stays off; brokerage = buy / sell leg % above
+            cfg.slippage_pct, cfg.brokerage_pct = 0.0, 0.0          # slippage stays off; brokerage is NOT part of the run - choose it in Results
+            cfg.brokerage_on = False
             bar = st.progress(0.0, text="Loading history...")
 
             def _prog(n, total, sym):
